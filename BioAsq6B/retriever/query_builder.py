@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Query builder for various uses"""
-from . import DEFAULTS, utils
+from . import DEFAULTS
+from . import utils
 from .. import tokenizers
 from ..data_services import MetamapExt
 

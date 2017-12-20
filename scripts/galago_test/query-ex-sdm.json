@@ -1,0 +1,13 @@
+{
+    "verbose" : true,
+    "casefold" : false,
+    "requested" : 10,
+    "index" : "/home/jno236/data/galago-medline-full-idx",
+    "defaultTextPart": "postings",
+    "queries" :  [
+        {
+            "number" : "q1",
+            "text": "#sdm(genetic basis tuberous sclerosis D014402)"
+        }
+    ]
+}

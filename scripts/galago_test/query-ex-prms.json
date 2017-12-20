@@ -1,0 +1,21 @@
+{
+    "verbose" : true,
+    "casefold" : false,
+    "requested" : 10,
+    "index" : "/home/jno236/data/galago-medline-full-idx",
+    "relevanceModel":
+    "org.lemurproject.galago.core.retrieval.prf.RelevanceModel3",
+    "fields": ["title", "text", "mesh_desc", "keywords"],
+    "weights": {
+      "title": 0.3,
+      "text": 0.3,
+      "mesh_desc": 0.3,
+      "keywords": 0.1
+    },
+    "queries" :  [
+        {
+            "number": "specific-16003132",
+            "text": "#prms(genetic basis tuberous sclerosis D014402)"
+        }
+    ]
+}

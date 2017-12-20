@@ -4,6 +4,9 @@ import os
 from .. import DATA_DIR
 from ..tokenizers import SpacyTokenizer
 
+DEFAULTS = {
+    'tokenizer': SpacyTokenizer
+}
 
 def set_default(key, value):
     global DEFAULTS

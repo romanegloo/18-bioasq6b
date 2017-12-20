@@ -12,12 +12,12 @@ with open('requirements.txt') as f:
     reqs = f.read()
 
 setup(
-    name='BioAsq6b',
+    name='BioAsq6B',
     version='0.1.0',
-    description='pipeline for question answering in BioAsq6b task',
+    description='pipeline for question answering in BioAsq6B task',
     long_description=readme,
     license=license,
     python_requires='>=3.5',
-    packages=find_packages(exclude=('data')),
+    packages=find_packages(),
     install_requires=reqs.strip().split('\n'),
 )

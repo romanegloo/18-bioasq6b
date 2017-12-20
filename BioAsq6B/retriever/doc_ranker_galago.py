@@ -6,6 +6,9 @@ import subprocess
 import json
 import tempfile
 import sqlite3
+import os
+from collections import OrderedDict
+
 from . import DEFAULTS
 from . import utils
 
@@ -21,21 +24,37 @@ class GalagoRanker(object):
         self.ngrams = ngrams
 
 
-    def batch_closest_docs(self, queries, k=1):
+    def batch_closest_docs(self, queries, k=10):
         """parse batch queries, run doc ranker, and return the list of ranked
         documents in trec-eval format"""
-        q_obj = self.parse(queries, k)
+        if self.args.query_model == 'sdm':
+            q_obj = self.query_sdm(queries, k)
+        elif self.args.query_model == 'rm':
+            q_obj = self.query_rm(queries, k)
+        else:
+            q_obj = self.query_baseline(queries, k)
 
         # save temporary query_file for galago use
         (_, fp) = tempfile.mkstemp()
-        json.dump(q_obj, fp, indent=4, separators=(',', ': '))
+        with open(fp, 'w') as out_f:
+            json.dump(q_obj, fp=out_f, indent=4, separators=(',', ': '))
 
-    def closest_docs(self, query, k=1):
+        # run galago
+        p = subprocess.run(['galago', 'batch-search', fp],
+                           stdout=subprocess.PIPE)
+        if os.path.exists(fp):
+            os.remove(fp)
+
+        if self.args.verbose:
+            print(p.stdout.decode('utf-8'))
+        return self._batch_extract_id_scores(p.stdout.decode('utf-8'))
+
+    def closest_docs(self, query, k=10):
         """Closest docs for one query"""
         if self.args.query_model == 'sdm':
             q_obj = self.query_sdm([query], k)
-        elif self.args.query_model == 'prms':
-            q_obj = self.query_prms([query], k)
+        elif self.args.query_model == 'rm':
+            q_obj = self.query_rm([query], k)
         else:
             q_obj = self.query_baseline([query], k)
 
@@ -47,6 +66,8 @@ class GalagoRanker(object):
         # run galago
         p = subprocess.run(['galago', 'batch-search', fp],
                            stdout=subprocess.PIPE)
+        if os.path.exists(fp):
+            os.remove(fp)
 
         if self.args.verbose:
             print(p.stdout.decode('utf-8'))
@@ -62,7 +83,7 @@ class GalagoRanker(object):
             'queries': []
         }
         for i, q in enumerate(queries):
-            query = {'number': 'q' + str(i)}
+            query = {'number': q['id']}
             tokens = self.tokenizer.tokenize(q['body'])
             # when using sdm or fdm, n-gram (n > 1) tokenizing is unnecessary
             ngrams = tokens.ngrams(n=1, uncased=True,
@@ -91,27 +112,24 @@ class GalagoRanker(object):
             q_tmpl['queries'].append(query)
         return q_tmpl
 
-    def query_prms(self, queries, k=1):
+    def query_rm(self, queries, k=1):
         """Pseudo Relevance Model for Semi-structured Data"""
         q_tmpl = {
             'verbose': self.args.verbose,
             'casefold': False,
-            'defaultTextPart': 'postings',
             'index': self.index_path,
+            'defaultTextPart': 'postings',
             'requested': k,
-            "relevanceModel":
+            'relevanceModel':
                 "org.lemurproject.galago.core.retrieval.prf.RelevanceModel3",
-            "fields": ["title", "text", "mesh_desc", "keywords"],
-            "weights": {
-                "title": 0.3,
-                "text": 0.4,
-                "mesh_desc": 0.2,
-                "keywords": 0.1
-            },
+            'fbDocs': 3,
+            'fbTerm': 5,
+            'fbOrigWeight': 0.75,
+            'rmstopwords': 'rmstop',
             'queries': []
         }
         for i, q in enumerate(queries):
-            query = {'number': 'q' + str(i)}
+            query = {'number': q['id']}
             tokens = self.tokenizer.tokenize(q['body'])
             ngrams = tokens.ngrams(n=1, uncased=True,
                                    filter_fn=utils.filter_ngram)
@@ -120,26 +138,30 @@ class GalagoRanker(object):
                      for t in ngrams]
             # mesh
             ui, desc = self._mesh_ui(q['id'])
-            print(ui, desc)
-            # sdm component
-            sdm_ = '{}'.format(' '.join(terms_ + ui))
-            # # mesh_desc
-            # desc_ = []
-            # for t in desc:
-            #     if len(t.split()) > 1:
-            #         desc_.append("#inside(#od:1({}) #field:mesh_desc())"
-            #                      "".format(t))
-            #     else:
-            #         desc_.append("#inside({} #field:mesh_desc())".format(t))
-            # desc_ = "#combine({})".format(' '.join(desc_)) if len(desc_) else ''
-            # mesh_ui
-            # ui_ = ["#inside({} #field:mesh_ui())".format(t) for t in ui]
-            # ui_ = "#combine({})".format(' '.join(ui_)) if len(ui_) else ''
 
-            # combine
-            # note. I get "Could not extract term from child node" error when
-            #  'inside' is in prms
-            q_ = "#prms({})".format(sdm_)
+            # TESTING SDM in PRMS-------------
+            # print(ui, desc)
+            # # sdm component
+            # sdm_ = '{}'.format(' '.join(terms_ + ui))
+            # # # mesh_desc
+            # # desc_ = []
+            # # for t in desc:
+            # #     if len(t.split()) > 1:
+            # #         desc_.append("#inside(#od:1({}) #field:mesh_desc())"
+            # #                      "".format(t))
+            # #     else:
+            # #         desc_.append("#inside({} #field:mesh_desc())".format(t))
+            # # desc_ = "#combine({})".format(' '.join(desc_)) if len(desc_) else ''
+            # # mesh_ui
+            # # ui_ = ["#inside({} #field:mesh_ui())".format(t) for t in ui]
+            # # ui_ = "#combine({})".format(' '.join(ui_)) if len(ui_) else ''
+            #
+            # # combine
+            # # note. I get "Could not extract term from child node" error when
+            # #  'inside' is in prms
+            # q_ = "#prms({})".format(sdm_)
+
+            q_ = "#rm({})".format(' '.join(terms_ + ui))
             query['text'] = q_
             query['sdm.od.width'] = 2
             q_tmpl['queries'].append(query)
@@ -171,6 +193,26 @@ class GalagoRanker(object):
             query['text'] = '#sdm({})'.format(q_)
             q_tmpl['queries'].append(query)
         return q_tmpl
+
+    def _batch_extract_id_scores(self, results):
+        resDict = OrderedDict()
+        for rec in results.splitlines():
+            fields = rec.split()
+            if len(fields) == 6 and fields[5] == 'galago':
+                if fields[0] not in resDict:
+                    resDict[fields[0]] = {'docids': [], 'scores': []}
+                resDict[fields[0]]['docids'].append(
+                    fields[2].replace('PMID-', ''))
+                resDict[fields[0]]['scores'].append(float(fields[4]))
+
+        lst_docids = []
+        lst_scores = []
+        for _, q in resDict.items():
+            lst_docids.append(q['docids'])
+            lst_scores.append(q['scores'])
+            assert len(q['docids']) == len(q['scores']), \
+                "doc_id does not map to scores exactly"
+        return lst_docids, lst_scores
 
     def _extract_id_scores(self, results):
         doc_ids = []
