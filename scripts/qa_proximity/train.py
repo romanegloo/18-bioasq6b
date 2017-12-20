@@ -7,11 +7,11 @@ import os
 import sys
 from multiprocessing import cpu_count
 import copy
-
+import time
 import torch
 from torch.utils.data import DataLoader, sampler
 
-
+from BioAsq6B.qa_proximity import utils, QaProx
 logger = logging.getLogger()
 
 
@@ -58,21 +58,10 @@ def add_arguments(parser):
 
     # Model Architecture: model specific options
     model = parser.add_argument_group('Model Architecture')
-    model.add_argument('--model-type', type=str, default='cnn',
-                       choices=['cnn', 'rnn'],
-                       help='Model architecture type')
-    model.add_argument('--use-feature-tags', action='store_true',
-                       help='add nlp annotations to the inputs')
-    model.add_argument('--embedding-dim', type=int, default=300,
-                       help='Embedding size if embedding_file is not given')
     model.add_argument('--hidden-dim', type=int, default=64,
                        help='GRU hidden dimension')
-    model.add_argument('--doc-maxlen', type=int, default=500,
-                       help='Max length of document in words')
-    model.add_argument('--kernel-num', type=int, default=64,
-                       help='number of each kind of kernel')
-    model.add_argument('--kernel-sizes', type=str, default='3,4,5',
-                       help='Comma-separated kernel sizes used for CNN')
+    model.add_argument('--sent-maxlen', type=int, default=100,
+                       help='Max length of a sentence in words')
     model.add_argument('--dropout', type=float, default=0.5,
                        help='the probability for dropout')
     model.add_argument('--weight-decay', type=float, default=1e-3,
@@ -82,10 +71,6 @@ def add_arguments(parser):
     optim = parser.add_argument_group('Optimization')
     optim.add_argument('--optimizer', type=str, default='adamax',
                        help='Optimizer: sgd or adamax')
-    optim.add_argument('--fix-embeddings', type='bool', default=True,
-                       help='Keep word embeddings fixed (use pretrained)')
-    optim.add_argument('--grad-clipping', type=float, default=10,
-                       help='Gradient clipping')
 
     # Saving + Loading
     save_load = parser.add_argument_group('Saving/Loading')
@@ -93,6 +78,7 @@ def add_arguments(parser):
                            help='Save model + optimizer state after each epoch')
     save_load.add_argument('--pretrained', type=str, default='',
                            help='Path to a pretrained model to warm-start with')
+
 
 def init():
     """set default values and initialize components"""
@@ -104,43 +90,32 @@ def init():
     console.setFormatter(fmt)
     logger.addHandler(console)
 
-
     logger.info('-' * 100)
     logger.info('Initializing...')
 
     # set default values
-    args.kernel_sizes = [int(k) for k in args.kernel_sizes.split(',')]
-    args.class_num = 2  # pos or neg
+    args.class_num = 2  # relevant (0) or irrelevant (1)
     if args.run_name is None:
         import uuid
-        import time
         args.run_name = time.strftime("%Y%m%d-") + str(uuid.uuid4())[:8]
     logger.info('RUN: {}'.format(args.run_name))
-    args.data_workers = cpu_count()
     args.cuda = not args.no_cuda and torch.cuda.is_available()
 
     # set paths
     if args.data_dir is None:
         args.data_dir = os.path.join(os.path.dirname(__file__),
-                                     '../data')
+                                     '../../../data/qa_prox')
     if args.var_dir is None:
-        args.var_dir = os.path.join(os.path.dirname(__file__), '../var')
-    if args.train_file is None:
-        args.train_file = os.path.join(args.data_dir,
-                                       'processed/imdb-processed-train.txt')
-    else:
-        args.train_file = os.path.join(args.data_dir, args.train_file)
-    if args.test_file is None:
-        args.test_file = os.path.join(args.data_dir,
-                                      'processed/imdb-processed-test.txt')
-    else:
-        args.test_file = os.path.join(args.data_dir, args.test_file)
+        args.var_dir = os.path.join(args.data_dir, 'var')
+    if not os.path.exists(args.var_dir):
+        os.mkdir(args.var_dir)
 
     if args.embedding_file is None:
         args.embedding_file = os.path.join(args.data_dir,
-                                           'embeddings/wiki.en.vec')
+                                  'embeddings/wikipedia-pubmed-and-PMC-w2v.bin')
         if not os.path.isfile(args.embedding_file):
             raise IOError('No such file: %s' % args.embedding_file)
+
     # path to save model file
     args.model_file = os.path.join(args.var_dir,
                                    '{}-best.mdl'.format(args.run_name))
@@ -164,9 +139,9 @@ def prepare_dataloader():
     global args
     logger.info('-' * 100)
     logger.info('Loading Datasets...')
-    train_ex = utils.load_data(args.train_file)
+    train_ex = utils.load_data(os.path.join(args.data_dir, 'train'))
     logger.info('{} train examples loaded'.format(len(train_ex)))
-    test_ex = utils.load_data(args.test_file)
+    test_ex = utils.load_data(os.path.join(args.data_dir, 'test'))
     logger.info('{} test examples loaded'.format(len(test_ex)))
 
     logger.info('Building feature dictionary...')
@@ -185,14 +160,15 @@ def prepare_dataloader():
         kwargs = {'num_workers': 0, 'pin_memory': True}
     else:
         kwargs = {'num_workers': args.data_workers}
-    train_dataset = data.ImdbDataset(args, train_ex, word_dict, feature_dict)
+
+    train_dataset = utils.QaProxDataset(args, train_ex, word_dict, feature_dict)
     train_loader = DataLoader(
         train_dataset,
         batch_size=args.batch_size,
         sampler=sampler.RandomSampler(train_dataset),
         **kwargs
     )
-    test_dataset = data.ImdbDataset(args, test_ex, word_dict, feature_dict)
+    test_dataset = utils.QaProxDataset(args, test_ex, word_dict, feature_dict)
     test_loader = DataLoader(
         test_dataset,
         batch_size=args.batch_size,
@@ -335,60 +311,60 @@ if __name__ == '__main__':
         if args.pretrained:
             pass
         else:
-            model = ImdbSA(args, word_dict=word_dict, feature_dict=feature_dict)
+            model = QaProx(args, word_dict=word_dict, feature_dict=feature_dict)
 
-    model_summary = model.torch_summarize()
-    if args.print_parameters:
-        logger.info(model_summary)
-
-    # set cpu/gpu mode
-    if args.cuda:
-        torch.cuda.set_device(args.gpu)
-        logger.info('CUDA enabled (GPU %d)' % args.gpu)
-        model.cuda()
-    else:
-        logger.info('Running on CPU only.')
-    # Use multiple GPUs?
-    # if args.parallel:
-    #     model.parallelize()
-
-    model.init_optimizer()
-    if args.embedding_file:
-        model.load_embeddings(word_dict.tokens(), args.embedding_file)
-
-    # --------------------------------------------------------------------------
-    # Train/Validation loop
-    # --------------------------------------------------------------------------
-    stats = {'epoch': 0, 'timer': utils.Timer(),
-             'best_valid': 0, 'best_valid_at': 0,
-             'best_ratio': 0, 'best_ratio_at': 0,
-             'acc_train': [], 'acc_test': [], 'losses': []}
-
-    for epoch in range(0, args.num_epochs):
-        stats['epoch'] = epoch
-        try:
-            train(args, train_loader, model, stats)
-            validate(args, train_loader, model, stats, mode='train')
-            best_updated = \
-                validate(args, test_loader, model, stats, mode='test')
-            if best_updated:
-                # save the best model
-                params = {
-                    'word_dict': model.word_dict,
-                    'args': model.args,
-                    'state_dict': copy.copy(model.network.state_dict())
-                }
-                try:
-                    torch.save(params, args.model_file)
-                except BaseException:
-                    logger.warning('WARN: Saving failed... continuing anyway.')
-
-        except KeyboardInterrupt:
-            logger.warning('Training loop terminated')
-            report(stats)
-            exit(1)
-
-    # --------------------------------------------------------------------------
-    # Report the results
-    # --------------------------------------------------------------------------
-    report(stats)
+    # model_summary = model.torch_summarize()
+    # if args.print_parameters:
+    #     logger.info(model_summary)
+    #
+    # # set cpu/gpu mode
+    # if args.cuda:
+    #     torch.cuda.set_device(args.gpu)
+    #     logger.info('CUDA enabled (GPU %d)' % args.gpu)
+    #     model.cuda()
+    # else:
+    #     logger.info('Running on CPU only.')
+    # # Use multiple GPUs?
+    # # if args.parallel:
+    # #     model.parallelize()
+    #
+    # model.init_optimizer()
+    # if args.embedding_file:
+    #     model.load_embeddings(word_dict.tokens(), args.embedding_file)
+    #
+    # # --------------------------------------------------------------------------
+    # # Train/Validation loop
+    # # --------------------------------------------------------------------------
+    # stats = {'epoch': 0, 'timer': utils.Timer(),
+    #          'best_valid': 0, 'best_valid_at': 0,
+    #          'best_ratio': 0, 'best_ratio_at': 0,
+    #          'acc_train': [], 'acc_test': [], 'losses': []}
+    #
+    # for epoch in range(0, args.num_epochs):
+    #     stats['epoch'] = epoch
+    #     try:
+    #         train(args, train_loader, model, stats)
+    #         validate(args, train_loader, model, stats, mode='train')
+    #         best_updated = \
+    #             validate(args, test_loader, model, stats, mode='test')
+    #         if best_updated:
+    #             # save the best model
+    #             params = {
+    #                 'word_dict': model.word_dict,
+    #                 'args': model.args,
+    #                 'state_dict': copy.copy(model.network.state_dict())
+    #             }
+    #             try:
+    #                 torch.save(params, args.model_file)
+    #             except BaseException:
+    #                 logger.warning('WARN: Saving failed... continuing anyway.')
+    #
+    #     except KeyboardInterrupt:
+    #         logger.warning('Training loop terminated')
+    #         report(stats)
+    #         exit(1)
+    #
+    # # --------------------------------------------------------------------------
+    # # Report the results
+    # # --------------------------------------------------------------------------
+    # report(stats)
