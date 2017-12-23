@@ -65,10 +65,15 @@ def build_dataset(questions, mode):
               ''.format(q['id'], cid+1, len(questions)) + ' '*20)
         if 'snippets' not in q:
             continue
+
+        # Parse the question first, which is used in common
+        q_ = nlp(q['body'])
+
+        # Parse relevant examples
         rel_offsets= {}
         cnt_rel = 0
         for s in q['snippets']:
-            # abnormal cases, just continue
+            # Abandon abnormal cases, just continue
             if s['beginSection'] not in SECTIONS or \
                     s['endSection'] not in SECTIONS:
                 print('unsupported section type - ({}, {})'
@@ -79,7 +84,7 @@ def build_dataset(questions, mode):
                       ''.format(s['beginSection'], s['endSection'] ))
                 continue
             docid = 'PMID-' + s['document'].split('/')[-1]
-            # keep track of the offsets, so that the irrelevant texts can be
+            # Keep track of the offsets, so that the irrelevant texts can be
             # extracted from the outside of the offset regions.
             if docid not in rel_offsets:
                 rel_offsets[docid] = []
@@ -91,16 +96,19 @@ def build_dataset(questions, mode):
             for sent in s_.sents:
                 cnt_rel += 1
                 rec = {}
-                rec['question'] = q['body']
+                rec['qid'] = q['id']
+                rec['question'] = [t.text.lower() for t in q_]
+                rec['q_pos'] = [t.pos_ for t in q_]
+                rec['q_ner'] = [t.ent_type_ for t in q_]
                 rec['type'] = q['type']
                 rec['label'] = 1
-                rec['context'] = sent.text.lower()
+                rec['context'] = [t.text.lower() for t in s_]
                 rec['pos'] = [t.pos_ for t in s_]
                 rec['ner'] = [t.ent_type_ for t in s_]
                 with open(os.path.join(OUT_DIR, mode, 'rel.txt'), 'a') as f:
                     f.write(json.dumps(rec) + '\n')
 
-        # now generate irrelevant examples
+        # Generate irrelevant examples
         # ----------------------------------------------------------------------
         irrel_sents = []  # generate irrelevant sentence list
         p = Pool(20)
@@ -110,19 +118,23 @@ def build_dataset(questions, mode):
             irrel_sents.extend(rst.get())
         p.close()
 
-        # sample the same number of irrelevant examples
+        # Sample the same number of irrelevant examples
         irrel_sents = random.sample(irrel_sents, min(cnt_rel, len(irrel_sents)))
         for sent in irrel_sents:
             s_ = nlp(sent)
             rec = {}
-            rec['question'] = q['body']
+            rec['qid'] = q['id']
+            rec['question'] = [t.text.lower() for t in q_]
+            rec['q_pos'] = [t.pos_ for t in q_]
+            rec['q_ner'] = [t.ent_type_ for t in q_]
             rec['type'] = q['type']
             rec['label'] = 0
-            rec['context'] = sent.lower()
+            rec['context'] = [t.text.lower() for t in s_]
             rec['pos'] = [t.pos_ for t in s_]
             rec['ner'] = [t.ent_type_ for t in s_]
             with open(os.path.join(OUT_DIR, mode, 'irrel.txt'), 'a+') as f:
                 f.write(json.dumps(rec) + '\n')  # write out
+
 
 if __name__ == '__main__':
     # load spacy nlp
@@ -130,7 +142,8 @@ if __name__ == '__main__':
 
     # start from scratch
     if os.path.exists(OUT_DIR):
-        shutil.rmtree(OUT_DIR)
+        shutil.rmtree(os.path.join(OUT_DIR, 'train'))
+        shutil.rmtree(os.path.join(OUT_DIR, 'test'))
     Path(os.path.join(OUT_DIR, 'train')).mkdir(parents=True, exist_ok=True)
     Path(os.path.join(OUT_DIR, 'test')).mkdir(parents=True, exist_ok=True)
 
@@ -140,8 +153,6 @@ if __name__ == '__main__':
     for data_idx in range(2):
         mode = 'train' if data_idx == 0 else 'test'
         print('building dataset for {}'.format(mode))
-        if data_idx == 0:
-            continue
         questions = []
         for year in data_from[data_idx]:
             for batch in range(1, 6):

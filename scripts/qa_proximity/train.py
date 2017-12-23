@@ -11,6 +11,7 @@ import time
 import torch
 from torch.utils.data import DataLoader, sampler
 
+from BioAsq6B import common
 from BioAsq6B.qa_proximity import utils, QaProx
 logger = logging.getLogger()
 
@@ -34,6 +35,8 @@ def add_arguments(parser):
                          help='Train on CPU, even if GPUs are available.')
     runtime.add_argument('--gpu', type=int, default=-1,
                          help="Specify GPU device id to use")
+    runtime.add_argument('--parallel', type=bool, default=False,
+                         help="Use DataParallel on all available GPUs")
     runtime.add_argument('--num-epochs', type=int, default=30,
                          help='Train data iterations')
     runtime.add_argument('--batch-size', type=int, default=64,
@@ -58,6 +61,8 @@ def add_arguments(parser):
 
     # Model Architecture: model specific options
     model = parser.add_argument_group('Model Architecture')
+    model.add_argument('--embedding-dim', type=int, default=200,
+                       help='word embedding dimension')
     model.add_argument('--hidden-dim', type=int, default=64,
                        help='GRU hidden dimension')
     model.add_argument('--sent-maxlen', type=int, default=100,
@@ -100,6 +105,7 @@ def init():
         args.run_name = time.strftime("%Y%m%d-") + str(uuid.uuid4())[:8]
     logger.info('RUN: {}'.format(args.run_name))
     args.cuda = not args.no_cuda and torch.cuda.is_available()
+    args.data_workers = cpu_count()
 
     # set paths
     if args.data_dir is None:
@@ -186,9 +192,9 @@ def train(args, data_loader, model, global_stats):
     logger.info('Starting training/validation loop...')
 
     # Initialize meters and timers
-    train_loss = utils.AverageMeter()
-    train_loss_total = utils.AverageMeter()
-    epoch_time = utils.Timer()
+    train_loss = common.AverageMeter()
+    train_loss_total = common.AverageMeter()
+    epoch_time = common.Timer()
 
     # Run one epoch
     for idx, ex in enumerate(data_loader):
@@ -208,8 +214,8 @@ def train(args, data_loader, model, global_stats):
 def validate(args, data_loader, model, global_stats, mode):
     """Run one full validation"""
     epoch = global_stats['epoch']
-    eval_time = utils.Timer()
-    acc = utils.AverageMeter()
+    eval_time = common.Timer()
+    acc = common.AverageMeter()
     best_updated = False
 
     examples = 0
@@ -313,25 +319,27 @@ if __name__ == '__main__':
         else:
             model = QaProx(args, word_dict=word_dict, feature_dict=feature_dict)
 
-    # model_summary = model.torch_summarize()
-    # if args.print_parameters:
-    #     logger.info(model_summary)
-    #
-    # # set cpu/gpu mode
-    # if args.cuda:
-    #     torch.cuda.set_device(args.gpu)
-    #     logger.info('CUDA enabled (GPU %d)' % args.gpu)
-    #     model.cuda()
-    # else:
-    #     logger.info('Running on CPU only.')
-    # # Use multiple GPUs?
-    # # if args.parallel:
-    # #     model.parallelize()
-    #
-    # model.init_optimizer()
-    # if args.embedding_file:
-    #     model.load_embeddings(word_dict.tokens(), args.embedding_file)
-    #
+    model_summary = utils.torch_summarize(model)
+    if args.print_parameters:
+        logger.info(model_summary)
+
+    # set cpu/gpu mode
+    if args.cuda:
+        torch.cuda.set_device(args.gpu)
+        logger.info('CUDA enabled (GPU %d)' % args.gpu)
+        model.cuda()
+    else:
+        logger.info('Running on CPU only.')
+    # Use multiple GPUs?
+    if args.parallel:
+        model.parallelize()
+
+    if args.embedding_file:
+        model.load_embeddings(word_dict.tokens(), args.embedding_file)
+
+    # Set up optimizer
+    model.init_optimizer()
+
     # # --------------------------------------------------------------------------
     # # Train/Validation loop
     # # --------------------------------------------------------------------------

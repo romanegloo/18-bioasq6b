@@ -6,7 +6,9 @@ import unicodedata
 import os
 
 import torch
+from torch.nn.modules.module import _addindent
 from torch.utils.data import Dataset
+import numpy as np
 
 logger = logging.getLogger(__name__)
 
@@ -139,6 +141,52 @@ def load_words(examples):
             words.add(w)
 
     words = set()
+    curr_qid = ''
     for ex in examples:
+        if curr_qid != ex['qid']:
+            curr_qid = ex['qid']
+            _insert(ex['question'])
         _insert(ex['context'])
     return words
+
+# ------------------------------------------------------------------------------
+# Utils
+# - torch_summarize: displays the summary note with weights and parameters of
+#  the network (obtained from http://bit.ly/2glYWVV)
+# ------------------------------------------------------------------------------
+
+def torch_summarize(model, show_weights=False, show_parameters=True):
+    """
+    Summarizes torch model by showing trainable parameters and weights
+    author: wassname
+    url: https://gist.github.com/wassname/0fb8f95e4272e6bdd27bd7df386716b7
+    license: MIT
+    """
+    tmpstr = model.__class__.__name__ + ' (\n'
+    for key, module in model.network._modules.items():
+        # if it contains layers let call it recursively to get params and weights
+        is_container = type(module) in [
+            torch.nn.modules.container.Container,
+            torch.nn.modules.container.Sequential,
+            torch.nn.Module
+        ]
+        if is_container:
+            modstr = torch_summarize(module)
+        else:
+            modstr = module.__repr__()
+        modstr = _addindent(modstr, 2)
+
+        params = sum([np.prod(p.size()) for p in module.parameters()])
+        weights = tuple([tuple(p.size()) for p in module.parameters()])
+
+        tmpstr += '  (' + key + '): ' + modstr
+        if show_weights:
+            tmpstr += ', weights={}'.format(weights)
+        if show_parameters:
+            tmpstr += ', parameters={}'.format(params)
+        tmpstr += '\n'
+        if is_container:
+            tmpstr += '\n'
+
+    tmpstr = tmpstr + ')'
+    return tmpstr

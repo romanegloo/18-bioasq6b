@@ -15,7 +15,7 @@ from pathlib import PosixPath
 import prettytable
 import math
 
-import utils as utils
+import common as utils
 
 DATA_DIR = \
     os.path.join(PosixPath(__file__).absolute().parents[4].as_posix(), 'data')

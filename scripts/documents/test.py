@@ -10,7 +10,7 @@ import re
 import math
 
 from BioAsq6B import retriever
-from BioAsq6B.utils import Timer, AverageMeter, measure_performance
+from BioAsq6B.common import Timer, AverageMeter, measure_performance
 
 parser = argparse.ArgumentParser()
 parser.add_argument('-y', '--year', type=int, default=4, choices=[1,2,3,4],
