@@ -86,11 +86,83 @@ class QaProxDataset(Dataset):
         self.sent_lengths = [0] * len(examples)
         self.feature_dict = feature_dict
 
+    def __len__(self):
+        return len(self.ex)
+
+    def __getitem__(self, idx):
+        ex = self.ex[idx]
+
+        # Index words
+        context = torch.LongTensor([self.word_dict[w] for w in ex['context']])
+        question = torch.LongTensor([self.word_dict[w] for w in ex['question']])
+
+        # Create feature vector
+        feat_c = torch.zeros(len(ex['context']), len(self.feature_dict))
+        feat_q = torch.zeros(len(ex['question']), len(self.feature_dict))
+
+        # Feature POS
+        for pos in ['pos', 'q_pos']:
+            for i, w in enumerate(ex[pos]):
+                if 'pos='+w in self.feature_dict:
+                    if pos == 'pos':
+                        feat_c[i][self.feature_dict['pos='+w]] = 1.0
+                    else:
+                        feat_q[i][self.feature_dict['pos='+w]] = 1.0
+
+        # Feature NER
+        for ner in ['ner', 'q_ner']:
+            for i, w in enumerate(ex[ner]):
+                if 'pos='+w in self.feature_dict:
+                    if ner == 'ner':
+                        feat_c[i][self.feature_dict['ner='+w]] = 1.0
+                    else:
+                        feat_q[i][self.feature_dict['ner='+w]] = 1.0
+
+        return context, feat_c, question, feat_q, ex['label'], ex['qid']
+
+    def _get_doc_lengths(self):
+        # may need this for sorting examples by doc length
+        pass
+
+
+def batchify(batch):
+    """collation_fn for data-loader; merge a list of samples to form a batch"""
+    contexts = [ex[0] for ex in batch]
+    features_c = [ex[1] for ex in batch]
+    questions = [ex[2] for ex in batch]
+    features_q = [ex[3] for ex in batch]
+    y = [ex[4] for ex in batch]
+    qids = [ex[5] for ex in batch]
+
+    # Batch documents and features
+    max_length = max([c.size(0) for c in contexts])
+    x1 = torch.LongTensor(len(contexts), max_length).zero_()
+    x1_mask = torch.ByteTensor(len(contexts), max_length).fill_(1)
+    x1_f = torch.zeros(len(contexts), max_length, features_c[0].size(1))
+    for i, c in enumerate(contexts):
+        x1[i, :c.size(0)].copy_(c)
+        x1_mask[i, :c.size(0)].fill_(0)
+        x1_f[i, :c.size(0)].copy_(features_c[i])
+
+    # Batch questions
+    max_length = max([q.size(0) for q in questions])
+    x2 = torch.LongTensor(len(questions), max_length).zero_()
+    x2_mask = torch.ByteTensor(len(questions), max_length).fill_(1)
+    x2_f = torch.zeros(len(questions), max_length, features_q[0].size(1))
+    for i, q in enumerate(questions):
+        x2[i, :q.size(0)].copy_(q)
+        x2_mask[i, :q.size(0)].fill_(0)
+        x2_f[i, :q.size(0)].copy_(features_q[i])
+
+    # Y
+    y = torch.LongTensor(y)
+
+    return x1, x1_f, x1_mask, x2, x2_f, x2_mask, y, qids
+
 
 # ------------------------------------------------------------------------------
 # helper functions
 # ------------------------------------------------------------------------------
-
 
 def load_data(data_dir):
     """Load examples from preprocessed file.
@@ -101,7 +173,7 @@ def load_data(data_dir):
     files = ['rel.txt', 'irrel.txt']
     for file in files:
         with open(os.path.join(data_dir, file)) as f:
-            examples = [json.loads(line) for line in f]
+            examples.extend([json.loads(line) for line in f])
     return examples
 
 

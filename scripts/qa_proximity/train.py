@@ -63,7 +63,7 @@ def add_arguments(parser):
     model = parser.add_argument_group('Model Architecture')
     model.add_argument('--embedding-dim', type=int, default=200,
                        help='word embedding dimension')
-    model.add_argument('--hidden-dim', type=int, default=64,
+    model.add_argument('--hidden-size', type=int, default=128,
                        help='GRU hidden dimension')
     model.add_argument('--sent-maxlen', type=int, default=100,
                        help='Max length of a sentence in words')
@@ -71,11 +71,15 @@ def add_arguments(parser):
                        help='the probability for dropout')
     model.add_argument('--weight-decay', type=float, default=1e-3,
                        help='Weight decay factor for optimizer')
+    model.add_argument('--concat-rnn-layers', type='bool', default=True,
+                       help='Combine hidden states from each encoding layer')
 
     # Optimization details
     optim = parser.add_argument_group('Optimization')
     optim.add_argument('--optimizer', type=str, default='adamax',
                        help='Optimizer: sgd or adamax')
+    optim.add_argument('--dropout-emb', type=float, default=0.4,
+                       help='Dropout rate for word embeddings')
 
     # Saving + Loading
     save_load = parser.add_argument_group('Saving/Loading')
@@ -172,6 +176,7 @@ def prepare_dataloader():
         train_dataset,
         batch_size=args.batch_size,
         sampler=sampler.RandomSampler(train_dataset),
+        collate_fn=utils.batchify,
         **kwargs
     )
     test_dataset = utils.QaProxDataset(args, test_ex, word_dict, feature_dict)
@@ -179,9 +184,11 @@ def prepare_dataloader():
         test_dataset,
         batch_size=args.batch_size,
         sampler=sampler.RandomSampler(test_dataset),
-        **kwargs
+        collate_fn=utils.batchify,
+        num_workers=0
     )
     return train_loader, test_loader, word_dict, feature_dict
+
 
 # ------------------------------------------------------------------------------
 # Train loop.
@@ -201,7 +208,6 @@ def train(args, data_loader, model, global_stats):
         loss = model.update(ex)[0]
         train_loss.update(loss)
         train_loss_total.update(loss)
-
         if idx % 10 == 0:
             logger.info('train: Epoch = {} | iter = {}/{} | loss = {:.2E} |'
                         ' Elapsed time = {:.2f}'
@@ -222,13 +228,13 @@ def validate(args, data_loader, model, global_stats, mode):
     for ex in data_loader:
         batch_size = ex[0].size(0)
         pred = model.predict(ex)
-        acc_ =  ex[-1].eq(pred.data.cpu()).sum() / batch_size
+        # acc_ =  ex[-2].eq(pred.data.cpu()).sum() / batch_size
+        acc_ = torch.LongTensor(ex[-2]).eq(pred.data.cpu()).sum() / batch_size
         acc.update(acc_, batch_size)
 
         # If getting train accuracies, sample max 10k
         examples += batch_size
-        # if mode == 'train' and examples >= 1e4:
-        if examples >= 1e3:
+        if mode == 'train' and examples >= 5e3:
             break
 
     logger.info("{} validation: examples = {} | accuracy = {}"
@@ -241,21 +247,14 @@ def validate(args, data_loader, model, global_stats, mode):
             global_stats['best_valid_at'] = epoch
             best_updated = True
         global_stats['acc_test'].append(acc.avg)
-        ratio = acc.avg / (model.num_free_params * (epoch + 1))**.1
-        if ratio > global_stats['best_ratio']:
-            logger.info('BEST RATIO: ratio={:.2f} (epoch {})'
-                        ''.format(ratio, epoch))
-            global_stats['best_ratio'] = ratio
-            global_stats['best_ratio_at'] = epoch
     return best_updated
 
 
 def report(stats):
     logger.info('-' * 100)
     logger.info('Report - RUN: {}'.format(args.run_name))
-    logger.info('Best Valid: {} (epoch {}), Best Ratio: {} (epoch {})'
-                ''.format(stats['best_valid'], stats['best_valid_at'],
-                          stats['best_ratio'], stats['best_ratio_at']))
+    logger.info('Best Valid: {} (epoch {})'
+                ''.format(stats['best_valid'], stats['best_valid_at']))
     if args.save_plots:
         import matplotlib
         matplotlib.use('Agg')
@@ -340,39 +339,38 @@ if __name__ == '__main__':
     # Set up optimizer
     model.init_optimizer()
 
-    # # --------------------------------------------------------------------------
-    # # Train/Validation loop
-    # # --------------------------------------------------------------------------
-    # stats = {'epoch': 0, 'timer': utils.Timer(),
-    #          'best_valid': 0, 'best_valid_at': 0,
-    #          'best_ratio': 0, 'best_ratio_at': 0,
-    #          'acc_train': [], 'acc_test': [], 'losses': []}
-    #
-    # for epoch in range(0, args.num_epochs):
-    #     stats['epoch'] = epoch
-    #     try:
-    #         train(args, train_loader, model, stats)
-    #         validate(args, train_loader, model, stats, mode='train')
-    #         best_updated = \
-    #             validate(args, test_loader, model, stats, mode='test')
-    #         if best_updated:
-    #             # save the best model
-    #             params = {
-    #                 'word_dict': model.word_dict,
-    #                 'args': model.args,
-    #                 'state_dict': copy.copy(model.network.state_dict())
-    #             }
-    #             try:
-    #                 torch.save(params, args.model_file)
-    #             except BaseException:
-    #                 logger.warning('WARN: Saving failed... continuing anyway.')
-    #
-    #     except KeyboardInterrupt:
-    #         logger.warning('Training loop terminated')
-    #         report(stats)
-    #         exit(1)
-    #
-    # # --------------------------------------------------------------------------
-    # # Report the results
-    # # --------------------------------------------------------------------------
-    # report(stats)
+    # --------------------------------------------------------------------------
+    # Train/Validation loop
+    # --------------------------------------------------------------------------
+    stats = {'epoch': 0, 'timer': common.Timer(),
+             'best_valid': 0, 'best_valid_at': 0,
+             'acc_train': [], 'acc_test': [], 'losses': []}
+
+    for epoch in range(0, args.num_epochs):
+        stats['epoch'] = epoch
+        try:
+            train(args, train_loader, model, stats)
+            validate(args, train_loader, model, stats, mode='train')
+            best_updated = \
+                validate(args, test_loader, model, stats, mode='test')
+            if best_updated:
+                # save the best model
+                params = {
+                    'word_dict': model.word_dict,
+                    'args': model.args,
+                    'state_dict': copy.copy(model.network.state_dict())
+                }
+                try:
+                    torch.save(params, args.model_file)
+                except BaseException:
+                    logger.warning('WARN: Saving failed... continuing anyway.')
+
+        except KeyboardInterrupt:
+            logger.warning('Training loop terminated')
+            report(stats)
+            exit(1)
+
+    # --------------------------------------------------------------------------
+    # Report the results
+    # --------------------------------------------------------------------------
+    report(stats)

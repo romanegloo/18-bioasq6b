@@ -2,8 +2,12 @@
 """Model Architecture"""
 
 import logging
+import math
 import torch
 import torch.optim as optim
+import torch.nn.functional as F
+from torch.autograd import Variable
+
 from gensim.models.keyedvectors import KeyedVectors
 
 from .network import QaProxBiRNN
@@ -18,6 +22,7 @@ class QaProx(object):
         self.args = args
         self.word_dict = word_dict
         self.feature_dict = feature_dict
+        self.args.num_features = len(feature_dict)
         self.updates = 0
         self.use_cuda = False
         self.parallel = False
@@ -62,32 +67,78 @@ class QaProx(object):
                     (len(embedding), 100 * len(embedding) / len(words)))
         w2v_model = None
 
-        # Below is for reading embedding file in text format, like FastText
-        # ----------------------------------------------------------------------
-        # vec_counts = {}
-        # with open(embedding_file) as f:
-        #     skip_first_line = False  # some formats starts with dimensions
-        #     for line in f:
-        #         if skip_first_line:
-        #             skip_first_line = False
-        #             continue
-        #         parsed = line.rstrip().split(' ')
-        #         assert(len(parsed) == embedding.size(1) + 1), line
-        #         w = self.word_dict.normalize(parsed[0])
-        #         if w in words:
-        #             vec = torch.Tensor([float(i) for i in parsed[1:]])
-        #             if w not in vec_counts:
-        #                 vec_counts[w] = 1
-        #                 embedding[self.word_dict[w]].copy_(vec)
-        #             else:
-        #                 logging.warning(
-        #                     'WARN: Duplicate embedding found for %s' % w
-        #                 )
-        #                 vec_counts[w] = vec_counts[w] + 1
-        #                 embedding[self.word_dict[w]].add_(vec)
-        # for w, c in vec_counts.items():
-        #     embedding[self.word_dict[w]].div_(c)
-        # logger.info('Loaded %d embeddings (%.2f%%)' %
-        #             (len(vec_counts), 100 * len(vec_counts) / len(words)))
+    def update(self, ex):
+        """Forward a batch of examples; step the optimizer to update weights
+        ex components:
+            x1, x1_f, x1_mask, x2, x2_f, x2_mask, y, qids
+        """
+        # Train mode
+        self.network.train()
+
+        # Add process for transferring data to GPU
+        if self.use_cuda:
+            inputs = [e if e is None else Variable(e.cuda(async=True))
+                      for e in ex[:6]]
+            target = Variable(ex[6].cuda(async=True))
+        else:
+            inputs = [e if e is None else Variable(e) for e in ex[:6]]
+            target = Variable(ex[6])
+
+        # Run forward
+        scores = self.network(*inputs)
+
+        # Compute loss and accuracies
+        loss = F.cross_entropy(scores, target)
+
+        # Clear gradients and run backward
+        self.optimizer.zero_grad()
+        loss.backward()
+
+        # todo. maybe add clip gradients here
+
+        # Update weights
+        self.optimizer.step()
+        self.updates += 1
+
+        return loss.data[0], ex[0].size(0)
 
 
+    # --------------------------------------------------------------------------
+    # Prediction
+    # --------------------------------------------------------------------------
+
+    def predict(self, ex):
+        # Eval mode
+        self.network.eval()
+
+        # Transfer to GPU
+        if self.use_cuda:
+            inputs = [e if e is None else
+                      Variable(e.cuda(async=True), volatile=True)
+                      for e in ex[:6]]
+        else:
+            inputs = [e if e is None else Variable(e, volatile=True)
+                      for e in ex[:6]]
+
+        # Forward
+        scores = self.network(*inputs)
+        return scores.max(1)[1]
+
+    # --------------------------------------------------------------------------
+    # Runtime
+    # --------------------------------------------------------------------------
+
+    def cuda(self):
+        self.use_cuda = True
+        self.network = self.network.cuda()
+
+    def cpu(self):
+        self.use_cuda = False
+        self.network = self.network.cpu()
+
+    def parallelize(self):
+        """Use data parallel to copy the model across several gpus.
+        This will take all gpus visible with CUDA_VISIBLE_DEVICES.
+        """
+        self.parallel = True
+        self.network = torch.nn.DataParallel(self.network)
