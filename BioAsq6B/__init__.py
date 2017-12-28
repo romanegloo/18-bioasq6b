@@ -11,5 +11,4 @@ DATA_DIR = (
 )
 
 from . import retriever
-from . import tokenizers
 from .data_services import BioasqAPI

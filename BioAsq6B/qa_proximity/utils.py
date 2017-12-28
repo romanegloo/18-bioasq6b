@@ -82,8 +82,6 @@ class QaProxDataset(Dataset):
     def __init__(self, args, examples, word_dict, feature_dict):
         self.ex = examples
         self.word_dict = word_dict
-        self.sent_maxlen = args.sent_maxlen
-        self.sent_lengths = [0] * len(examples)
         self.feature_dict = feature_dict
 
     def __len__(self):
@@ -93,6 +91,7 @@ class QaProxDataset(Dataset):
         ex = self.ex[idx]
 
         # Index words
+        # todo. check this part. LongTensor then batchify?
         context = torch.LongTensor([self.word_dict[w] for w in ex['context']])
         question = torch.LongTensor([self.word_dict[w] for w in ex['question']])
 
@@ -119,10 +118,6 @@ class QaProxDataset(Dataset):
                         feat_q[i][self.feature_dict['ner='+w]] = 1.0
 
         return context, feat_c, question, feat_q, ex['label'], ex['qid']
-
-    def _get_doc_lengths(self):
-        # may need this for sorting examples by doc length
-        pass
 
 
 def batchify(batch):

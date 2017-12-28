@@ -23,7 +23,6 @@ class GalagoRanker(object):
         self.tokenizer = DEFAULTS['tokenizer']()
         self.ngrams = ngrams
 
-
     def batch_closest_docs(self, queries, k=10):
         """parse batch queries, run doc ranker, and return the list of ranked
         documents in trec-eval format"""
@@ -139,28 +138,6 @@ class GalagoRanker(object):
             # mesh
             ui, desc = self._mesh_ui(q['id'])
 
-            # TESTING SDM in PRMS-------------
-            # print(ui, desc)
-            # # sdm component
-            # sdm_ = '{}'.format(' '.join(terms_ + ui))
-            # # # mesh_desc
-            # # desc_ = []
-            # # for t in desc:
-            # #     if len(t.split()) > 1:
-            # #         desc_.append("#inside(#od:1({}) #field:mesh_desc())"
-            # #                      "".format(t))
-            # #     else:
-            # #         desc_.append("#inside({} #field:mesh_desc())".format(t))
-            # # desc_ = "#combine({})".format(' '.join(desc_)) if len(desc_) else ''
-            # # mesh_ui
-            # # ui_ = ["#inside({} #field:mesh_ui())".format(t) for t in ui]
-            # # ui_ = "#combine({})".format(' '.join(ui_)) if len(ui_) else ''
-            #
-            # # combine
-            # # note. I get "Could not extract term from child node" error when
-            # #  'inside' is in prms
-            # q_ = "#prms({})".format(sdm_)
-
             q_ = "#rm({})".format(' '.join(terms_ + ui))
             query['text'] = q_
             query['sdm.od.width'] = 2
@@ -233,7 +210,7 @@ class GalagoRanker(object):
         mesh_ui = []
         mesh_desc = []
         # initialize concepts db
-        # todo. We are ssuming that concepts db is prepared. In a real test
+        # todo. We are assuming that concepts db is prepared. In a real test
         # case, concepts need to be obtained adaptively.
         cnx = sqlite3.connect(self.db_path)
         csr = cnx.cursor()

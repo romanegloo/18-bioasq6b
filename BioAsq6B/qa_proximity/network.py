@@ -1,10 +1,12 @@
 #!/usr/bin/env python3
+import logging
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torch.autograd import Variable
 
+logger = logging.getLogger(__name__)
 
 # ------------------------------------------------------------------------------
 # Network Components
@@ -271,7 +273,12 @@ class QaProxBiRNN(nn.Module):
                                            training=self.training)
 
         # Encode (context + features) with RNN
-        c_hiddens = self.c_rnn(torch.cat([x1_emb, x1_f], 2), x1_mask)
+        try:
+            c_hiddens = self.c_rnn(torch.cat([x1_emb, x1_f], 2), x1_mask)
+        except RuntimeError:
+            logger.error(x1_emb.size())
+            logger.error(x1_f.size())
+            logger.error(x1_mask.size())
 
         # Encode (question + features) with RNN
         q_hiddens = self.q_rnn(torch.cat([x2_emb, x2_f], 2), x2_mask)

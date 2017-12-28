@@ -7,6 +7,7 @@ import torch
 import torch.optim as optim
 import torch.nn.functional as F
 from torch.autograd import Variable
+import copy
 
 from gensim.models.keyedvectors import KeyedVectors
 
@@ -16,8 +17,7 @@ logger = logging.getLogger(__name__)
 
 
 class QaProx(object):
-    def __init__(self, args, state_dict=None, word_dict=None,
-                 feature_dict=None):
+    def __init__(self, args, word_dict, feature_dict, state_dict=None):
         # book-keeping
         self.args = args
         self.word_dict = word_dict
@@ -26,7 +26,6 @@ class QaProx(object):
         self.updates = 0
         self.use_cuda = False
         self.parallel = False
-
         self.network = QaProxBiRNN(args)
 
         # load saved state, if exists
@@ -39,10 +38,16 @@ class QaProx(object):
             p.requires_grad = False
         parameters = [p for p in self.network.parameters() if p.requires_grad]
         if self.args.optimizer == 'sgd':
+            logger.info('Optimizer: SGD (learning_rate: {} '
+                        'momentum: {}, weight_decay: {})'
+                        ''.format(self.args.learning_rate, self.args.momentum,
+                                  self.args.weight_decay))
             self.optimizer = optim.SGD(parameters, self.args.learning_rate,
                                        momentum=self.args.momentum,
                                        weight_decay=self.args.weight_decay)
         elif self.args.optimizer == 'adamax':
+            logger.info('Optimizer: Adamax (weight_decay: {})'
+                        ''.format(self.args.weight_decay))
             self.optimizer = optim.Adamax(parameters,
                                           weight_decay=self.args.weight_decay)
         else:
@@ -94,7 +99,9 @@ class QaProx(object):
         self.optimizer.zero_grad()
         loss.backward()
 
-        # todo. maybe add clip gradients here
+        # Clip gradients
+        torch.nn.utils.clip_grad_norm(self.network.parameters(),
+                                      self.args.grad_clipping)
 
         # Update weights
         self.optimizer.step()
@@ -122,7 +129,8 @@ class QaProx(object):
 
         # Forward
         scores = self.network(*inputs)
-        return scores.max(1)[1]
+        return scores
+
 
     # --------------------------------------------------------------------------
     # Runtime
@@ -142,3 +150,32 @@ class QaProx(object):
         """
         self.parallel = True
         self.network = torch.nn.DataParallel(self.network)
+
+
+    # --------------------------------------------------------------------------
+    # Saving and loading
+    # --------------------------------------------------------------------------
+
+    def save(self, filename):
+        state_dict = copy.copy(self.network.state_dict())
+        params = {
+            'state_dict': state_dict,
+            'word_dict': self.word_dict,
+            'feature_dict': self.feature_dict,
+            'args': self.args,
+        }
+        try:
+            torch.save(params, filename)
+        except BaseException:
+            logger.warning('WARN: Saving failed... continuing anyway.')
+
+    @staticmethod
+    def load(filename):
+        logger.info('Loading QA_Prox model {}'.format(filename))
+        saved_params = torch.load( filename,
+                                   map_location=lambda storage, loc: storage)
+        word_dict = saved_params['word_dict']
+        feature_dict = saved_params['feature_dict']
+        state_dict = saved_params['state_dict']
+        args = saved_params['args']
+        return QaProx(args, word_dict, feature_dict, state_dict=state_dict)

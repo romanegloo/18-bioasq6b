@@ -5,7 +5,6 @@ import argparse
 import logging
 import os
 import sys
-from multiprocessing import cpu_count
 import copy
 import time
 import torch
@@ -13,7 +12,8 @@ from torch.utils.data import DataLoader, sampler
 
 from BioAsq6B import common
 from BioAsq6B.qa_proximity import utils, QaProx
-logger = logging.getLogger()
+
+logger = logging.getLogger(__name__)
 
 
 def str2bool(v):
@@ -65,12 +65,6 @@ def add_arguments(parser):
                        help='word embedding dimension')
     model.add_argument('--hidden-size', type=int, default=128,
                        help='GRU hidden dimension')
-    model.add_argument('--sent-maxlen', type=int, default=100,
-                       help='Max length of a sentence in words')
-    model.add_argument('--dropout', type=float, default=0.5,
-                       help='the probability for dropout')
-    model.add_argument('--weight-decay', type=float, default=1e-3,
-                       help='Weight decay factor for optimizer')
     model.add_argument('--concat-rnn-layers', type='bool', default=True,
                        help='Combine hidden states from each encoding layer')
 
@@ -78,8 +72,17 @@ def add_arguments(parser):
     optim = parser.add_argument_group('Optimization')
     optim.add_argument('--optimizer', type=str, default='adamax',
                        help='Optimizer: sgd or adamax')
-    optim.add_argument('--dropout-emb', type=float, default=0.4,
+    model.add_argument('--weight-decay', type=float, default=0,
+                       help='Weight decay factor for optimizer')
+    optim.add_argument('--dropout-emb', type=float, default=0,
                        help='Dropout rate for word embeddings')
+    optim.add_argument('--grad-clipping', type=float, default=10,
+                       help='Gradient clipping')
+    optim.add_argument('--learning-rate', type=float, default=0.1,
+                       help='Learning rate for SGD only')
+    optim.add_argument('--momentum', type=float, default=0,
+                       help='Momentum factor')
+
 
     # Saving + Loading
     save_load = parser.add_argument_group('Saving/Loading')
@@ -109,7 +112,7 @@ def init():
         args.run_name = time.strftime("%Y%m%d-") + str(uuid.uuid4())[:8]
     logger.info('RUN: {}'.format(args.run_name))
     args.cuda = not args.no_cuda and torch.cuda.is_available()
-    args.data_workers = cpu_count()
+    args.data_workers = 8
 
     # set paths
     if args.data_dir is None:
@@ -227,8 +230,8 @@ def validate(args, data_loader, model, global_stats, mode):
     examples = 0
     for ex in data_loader:
         batch_size = ex[0].size(0)
-        pred = model.predict(ex)
-        # acc_ =  ex[-2].eq(pred.data.cpu()).sum() / batch_size
+        scores = model.predict(ex)[0]
+        pred = scores.max(1)[1]
         acc_ = torch.LongTensor(ex[-2]).eq(pred.data.cpu()).sum() / batch_size
         acc.update(acc_, batch_size)
 
@@ -316,7 +319,7 @@ if __name__ == '__main__':
         if args.pretrained:
             pass
         else:
-            model = QaProx(args, word_dict=word_dict, feature_dict=feature_dict)
+            model = QaProx(args, word_dict, feature_dict)
 
     model_summary = utils.torch_summarize(model)
     if args.print_parameters:
@@ -354,17 +357,11 @@ if __name__ == '__main__':
             best_updated = \
                 validate(args, test_loader, model, stats, mode='test')
             if best_updated:
+                logger.info('Best valid: {:.2f} (epoch {}, {} updates)'
+                            ''.format(stats['best_valid'], stats['epoch'],
+                                      model.updates))
                 # save the best model
-                params = {
-                    'word_dict': model.word_dict,
-                    'args': model.args,
-                    'state_dict': copy.copy(model.network.state_dict())
-                }
-                try:
-                    torch.save(params, args.model_file)
-                except BaseException:
-                    logger.warning('WARN: Saving failed... continuing anyway.')
-
+                model.save(args.model_file)
         except KeyboardInterrupt:
             logger.warning('Training loop terminated')
             report(stats)
