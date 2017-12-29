@@ -129,10 +129,6 @@ def init():
         if not os.path.isfile(args.embedding_file):
             raise IOError('No such file: %s' % args.embedding_file)
 
-    # path to save model file
-    args.model_file = os.path.join(args.var_dir,
-                                   '{}-best.mdl'.format(args.run_name))
-
     # add file log handle (args.var_dir and args.run_name need to be defined)
     log_path = os.path.join(args.var_dir, 'run{}.log'.format(args.run_name))
     file = logging.FileHandler(log_path)
@@ -361,7 +357,11 @@ if __name__ == '__main__':
                             ''.format(stats['best_valid'], stats['epoch'],
                                       model.updates))
                 # save the best model
-                model.save(args.model_file)
+                model_file = os.path.join(
+                    args.var_dir,
+                    '{}-best-acc{:d}.mdl'.format(args.run_name,
+                                                 stats['best_valid'] * 100))
+                model.save(model_file)
         except KeyboardInterrupt:
             logger.warning('Training loop terminated')
             report(stats)

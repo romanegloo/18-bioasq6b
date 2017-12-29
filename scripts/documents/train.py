@@ -33,31 +33,29 @@ parser.add_argument('--qaprox-model', type=str,
                     help='Path to a QA_Proximity model')
 parser.add_argument('--ndocs', type=int, default=10,
                     help='Number of document to retrieve')
+parser.add_argument('--score-lambda', type=float, default=None,
+                    help='Weight on retrieval scores')
 parser.add_argument('-v', '--verbose', action='store_true',
                     help='Verbose mode')
 args = parser.parse_args()
 
-# set defaults
+# Set defaults
 DATA_DIR = os.path.join(os.path.dirname(__file__), '../../../data')
 args.test_dir = os.path.join(DATA_DIR, 'bioasq/test')
 args.index_path = os.path.join(DATA_DIR, 'galago-medline-full-idx')
 args.database = os.path.join(DATA_DIR, 'concepts.db')
-if args.ndocs == 10 and args.rerank:
-    args.ndocs *= 3
 if args.qaprox_model is None:
     args.qaprox_model = os.path.join(DATA_DIR, 'qa_prox/var/best.mdl')
 
-# retriever
+# Retriever
 doc_ranker = retriever.get_class('galago')(args)
-
-# re-ranker
+# Re-ranker
 re_ranker = reranker.RerankQaProx(args)
 
 # ------------------------------------------------------------------------------
 # Read question/answer datasets
 # ------------------------------------------------------------------------------
 questions = []
-print('reading training dataset...')
 for year in args.pool.split(','):
     # read all batch files of the year
     for batch in range(1,6):
@@ -65,6 +63,7 @@ for year in args.pool.split(','):
             continue
         batch_file = os.path.join(args.test_dir,
                                   "phaseB_{}b_0{}.json".format(year, batch))
+        print('reading train dataset from [{}]'.format(batch_file))
         with open(batch_file) as f:
             data = json.load(f)
             if args.qids:
@@ -73,7 +72,7 @@ for year in args.pool.split(','):
             else:
                 questions.extend(data['questions'])
 
-# sampling
+# Sampling
 if args.sample_size < 1:
     sample_size = int(len(questions) * args.sample_size)
 else:
@@ -94,41 +93,66 @@ else:
 run_time = Timer()
 avg_prec, avg_recall, avg_f1, map, logp = (AverageMeter() for i in range(5))
 
-# Retrieve documents
-print('Retrieving documents...')
-(lst_docid, ret_scores) = doc_ranker.batch_closest_docs(questions, k=args.ndocs)
-
-# Re-rank
-if args.rerank:
-    print('Re-ranking the results...')
-    rel_scores = re_ranker.run(lst_docid, ret_scores, questions)
+# # Retrieve documents
+# print('Retrieving documents...')
+# (lst_docids, lst_ret_scores) = \
+#     doc_ranker.batch_closest_docs(questions, k=args.ndocs)
+#
+# # Re-rank
+# lst_rel_scores = None
+# if args.rerank:
+#     print('Re-ranking the results...')
+#     lst_rel_scores = re_ranker.batch_get_prox_scores(lst_docids, questions)
 
 # ------------------------------------------------------------------------------
 # Display the results with performance measures
 # ------------------------------------------------------------------------------
-# set tabular format for eval results
-table = prettytable.PrettyTable(['Question', 'GT', 'Returned'])
+# Set tabular format for eval results
+table = prettytable.PrettyTable(['Question', 'GT', 'Returned', 'Scores'])
 table.align['Question'] = 'l'
 table.align['Returned'] = 'r'
 table.max_width['Question'] = 40
 
-for seq, res in enumerate(zip(lst_docid, ret_scores, rel_scores, questions)):
-    (docid, ret_scores, rel_scores, q) = res
-    # read expected documents
+# if args.rerank:
+#     answers = zip(questions, lst_docids, lst_ret_scores, lst_rel_scores)
+# else:
+#     answers = zip(questions, lst_docids, lst_ret_scores)
+
+for seq, q in enumerate(questions):
+    (docids, ret_scores) = doc_ranker.closest_docs(q)
+    rel_scores = None
+    if args.rerank:
+       print('Re-ranking the results...')
+       rel_scores = re_ranker.get_prox_scores(docids, q)
+
+    # Compute final scores; merge_scores returns list of OrderedDict
+    results = re_ranker.merge_scores(docids, ret_scores, rel_scores)
+
+    # Read expected documents
     d_exp = []
     for line in q['documents']:
         m = re.match(".*pubmed/(\d+)$", line)
         if m:
             d_exp.append(m.group(1))
+    # Print out
     table.clear_rows()
-    q_fld = '[{}]\n{}'.format(q['id'], q['body'])
-    col_ret = []
-    for d, s1, s2 in zip(docid, ret_scores, rel_scores):
-        d = colored(d, 'blue') if d in d_exp else d
-        col_ret.append('{:8} [{:.4f}, {:.4f}]'.format(d, s1, s2))
-    table.add_row([q_fld, '\n'.join(d_exp), '\n'.join(col_ret)])
+    col0 = '[{}]\n{}'.format(q['id'], q['body'])
+    col1 = '\n'.join(d_exp)
+    col2 = []  # returned documents
+    col3 = []  # scores
+    for k, v in results.items():
+        k = colored(k, 'blue') if k in d_exp else k
+        col2.append('{:>8}'.format(k))
+        if 'rel_score' in v:
+            col3.append('({:.4f}, {:.4f}, {:.4E})'
+                        ''.format(v['ret_score'], v['rel_score'], v['score']))
+        else:
+            col3.append('({:.4f}, {:.4E})'.format(v['ret_score'], v['score']))
+    col2 = '\n'.join(col2)
+    col3 = '\n'.join(col3)
+    table.add_row([col0, col1, col2, col3])
     print(table)
-    prec, recall, f1, ap = measure_performance(d_exp, docid)
+    prec, recall, f1, ap = measure_performance(d_exp, results.keys())
     print('batch #0: {}/{}'.format(seq+1, len(questions)))
     print('precision: {:.4f}, recall: {:.4f}, F1: {:.4f}, '
           'avg_precision: {:.4f}'.format(prec, recall, f1, ap))
