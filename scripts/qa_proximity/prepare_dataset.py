@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Reads bioasq test datasets which contain pairs of questions and relevant
 text snippets. The resulting datasets will be used for training a neural
-model that classifies the relevancy of a question and candidate text
+model that classifies the relevance of a question to the candidate text
 snippets"""
 
 import os
@@ -105,7 +105,9 @@ def build_dataset(questions, mode):
                 rec['context'] = [t.text.lower() for t in s_]
                 rec['pos'] = [t.pos_ for t in s_]
                 rec['ner'] = [t.ent_type_ for t in s_]
-                with open(os.path.join(OUT_DIR, mode, 'rel.txt'), 'a') as f:
+                with open(os.path.join(OUT_DIR, mode,
+                                       'rel-test{}.txt'.format( TEST_FROM[0])),
+                          'a') as f:
                     f.write(json.dumps(rec) + '\n')
 
         # Generate irrelevant examples
@@ -132,7 +134,9 @@ def build_dataset(questions, mode):
             rec['context'] = [t.text.lower() for t in s_]
             rec['pos'] = [t.pos_ for t in s_]
             rec['ner'] = [t.ent_type_ for t in s_]
-            with open(os.path.join(OUT_DIR, mode, 'irrel.txt'), 'a+') as f:
+            with open(os.path.join(OUT_DIR, mode,
+                                   'irrel-test{}.txt'.format(TEST_FROM[0])),
+                      'a+') as f:
                 f.write(json.dumps(rec) + '\n')  # write out
 
 
@@ -141,6 +145,7 @@ if __name__ == '__main__':
     nlp = spacy.load('en')
 
     # start from scratch
+    # todo. change it to maintain the existing files
     if os.path.exists(OUT_DIR):
         shutil.rmtree(os.path.join(OUT_DIR, 'train'))
         shutil.rmtree(os.path.join(OUT_DIR, 'test'))

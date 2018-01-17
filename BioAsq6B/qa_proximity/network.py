@@ -29,7 +29,6 @@ class EncoderBRNN(nn.Module):
                                     num_layers=self.num_layers,
                                     bidirectional=True))
 
-
     def forward(self, x, x_mask):
         """Encode either padded or non-padded sequences.
 
@@ -291,7 +290,3 @@ class QaProxBiRNN(nn.Module):
         score = self.rel_attn(c_hiddens, q_hidden, x1_mask)
 
         return score
-
-
-    def predict(self):
-        pass

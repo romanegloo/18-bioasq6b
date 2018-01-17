@@ -17,7 +17,7 @@ from BioAsq6B.common import Timer, AverageMeter, measure_performance
 # Set Options
 # ------------------------------------------------------------------------------
 parser = argparse.ArgumentParser()
-parser.add_argument('-p', '--pool', type=str, default='1,2,3',
+parser.add_argument('-p', '--pool', type=str, default='1,2,3,4',
                     help='Comma separated list of years for training dataset; '
                          'If you test on 4th year, add 1,2,3 for training.')
 parser.add_argument('-s', '--sample-size', type=float, default=.2,
@@ -42,35 +42,49 @@ args = parser.parse_args()
 # Set defaults
 DATA_DIR = os.path.join(os.path.dirname(__file__), '../../../data')
 args.test_dir = os.path.join(DATA_DIR, 'bioasq/test')
+args.train_dir = os.path.join(DATA_DIR, 'bioasq/train')
 args.index_path = os.path.join(DATA_DIR, 'galago-medline-full-idx')
 args.database = os.path.join(DATA_DIR, 'concepts.db')
 if args.qaprox_model is None:
     args.qaprox_model = os.path.join(DATA_DIR, 'qa_prox/var/best.mdl')
 
 # Retriever
+print('initializing retriever...')
 doc_ranker = retriever.get_class('galago')(args)
 # Re-ranker
+print('initializing re-ranker...')
 re_ranker = reranker.RerankQaProx(args)
 
 # ------------------------------------------------------------------------------
 # Read question/answer datasets
 # ------------------------------------------------------------------------------
 questions = []
-for year in args.pool.split(','):
-    # read all batch files of the year
-    for batch in range(1,6):
-        if year == '1' and batch >= 4:
-            continue
-        batch_file = os.path.join(args.test_dir,
-                                  "phaseB_{}b_0{}.json".format(year, batch))
-        print('reading train dataset from [{}]'.format(batch_file))
-        with open(batch_file) as f:
-            data = json.load(f)
-            if args.qids:
-                questions.extend([q for q in data['questions']
-                                 if q['id'] in args.qids])
-            else:
-                questions.extend(data['questions'])
+if args.pool == '5' or args.pool == '6':
+    batch_file = os.path.join(args.train_dir,
+                             'BioASQ-trainingDataset{}b.json'.format(args.pool))
+    with open(batch_file) as f:
+        data = json.load(f)
+        if args.qids:
+            questions.extend([q for q in data['questions']
+                              if q['id'] in args.qids])
+        else:
+            questions.extend(data['questions'])
+else:
+    for year in args.pool.split(','):
+        # read all batch files of the year
+        for batch in range(1, 6):
+            if year == '1' and batch >= 4:
+                continue
+            batch_file = os.path.join(args.test_dir,
+                                      "phaseB_{}b_0{}.json".format(year, batch))
+            print('reading train dataset from [{}]'.format(batch_file))
+            with open(batch_file) as f:
+                data = json.load(f)
+                if args.qids:
+                    questions.extend([q for q in data['questions']
+                                     if q['id'] in args.qids])
+                else:
+                    questions.extend(data['questions'])
 
 # Sampling
 if args.sample_size < 1:
@@ -119,7 +133,7 @@ table.max_width['Question'] = 40
 #     answers = zip(questions, lst_docids, lst_ret_scores)
 
 for seq, q in enumerate(questions):
-    (docids, ret_scores) = doc_ranker.closest_docs(q)
+    (docids, ret_scores) = doc_ranker.closest_docs(q, k=args.ndocs)
     rel_scores = None
     if args.rerank:
        print('Re-ranking the results...')
@@ -143,16 +157,18 @@ for seq, q in enumerate(questions):
     for k, v in results.items():
         k = colored(k, 'blue') if k in d_exp else k
         col2.append('{:>8}'.format(k))
-        if 'rel_score' in v:
-            col3.append('({:.4f}, {:.4f}, {:.4E})'
-                        ''.format(v['ret_score'], v['rel_score'], v['score']))
+        if 'rel_scores' in v:
+            col3.append('({:.2f}, ({:.2f}/{:.2f}/{:.2f}), {:.4E})'
+                        ''.format(v['ret_score'], v['rel_scores'][0],
+                                  v['rel_scores'][1], v['rel_scores'][2],
+                                  v['score']))
         else:
             col3.append('({:.4f}, {:.4E})'.format(v['ret_score'], v['score']))
     col2 = '\n'.join(col2)
     col3 = '\n'.join(col3)
     table.add_row([col0, col1, col2, col3])
     print(table)
-    prec, recall, f1, ap = measure_performance(d_exp, results.keys())
+    prec, recall, f1, ap = measure_performance(d_exp, list(results), cutoff=10)
     print('batch #0: {}/{}'.format(seq+1, len(questions)))
     print('precision: {:.4f}, recall: {:.4f}, F1: {:.4f}, '
           'avg_precision: {:.4f}'.format(prec, recall, f1, ap))

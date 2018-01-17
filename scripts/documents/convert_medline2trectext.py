@@ -1,20 +1,18 @@
 #!/usr/bin/env python3
 """This script converts PubMed Article document (medline) into TREC text
-format in order to be used by Galago build index process."""
+format which to be used by Galago build index process."""
 
 import argparse
 from lxml import etree
 import os
-import logging
 from tqdm import tqdm
-import re
 import gzip
 from multiprocessing import Pool, cpu_count
+from functools import partial
 from collections import OrderedDict
 
 
 def convert(file):
-
     # get the basename of the path, and unique filename
     filename = os.path.basename(file).split('.')[0]
     output_path = os.path.join(args.output_path, filename)
@@ -29,6 +27,7 @@ def convert(file):
 
     batch_seq = 0
     doc_seq = 0
+    empty_count = 0
     doc_content = []
     for doc in root.findall('PubmedArticle'):
         data = OrderedDict.fromkeys(
@@ -36,14 +35,25 @@ def convert(file):
              "MEDLINE_TA", "CHEMICAL_UI", "CHEMICAL",
              "MESH_UI", "MESH_DESC", "MESH_QUAL", "KEYWORDS"])
         data['DOCNO'] = 'PMID-' + doc.findtext('.//PMID')
-        data['TEXT'] = doc.findtext('.//Abstract/AbstractText')
+        data['TITLE'] = doc.findtext('.//ArticleTitle')
+        abstract_text = []
+        for t in doc.iterfind('.//Abstract/AbstractText'):
+            if t.text is None:
+                continue
+            text_ = t.text
+            if 'Label' in t.attrib:
+                text_ = t.attrib['Label'] + ': ' + text_
+            abstract_text.append(text_)
+        data['TEXT'] = ' '.join(abstract_text)
+        # If TEXT is empty, fill in the title.
+        # (TEXT field is key field in trec format; Without it the entire
+        # batch files will be ignored during indexing)
+        if len(data['TEXT'].strip()) == 0:
+            empty_count += 1
+            data['TEXT'] = data['TITLE']
         data['JOURNAL_TITLE'] = doc.findtext('.//Journal/Title')
         data['ISO_ABRV'] = doc.findtext('.//Journal/ISOAbbreviation')
         data['MEDLINE_TA'] = doc.findtext('.//MedlineTA')
-        data['TITLE'] = doc.findtext('.//ArticleTitle')
-        # text field required
-        if data['TEXT'] is None:
-            data['TEXT'] = ' '
         chemical_ui = []
         chemical = []
         for chem in doc.findall('.//Chemical'):
@@ -79,29 +89,38 @@ def convert(file):
         if len(keywords) > 0:
             data['KEYWORDS'] = keywords
 
-        doc_seq += 1
         doc_lines = ['<DOC>']
         for k, v in data.items():
             if v:
                 doc_lines.append('<{}>{}</{}>'.format(k, v, k))
         doc_lines.append('</DOC>')
         doc_content.append('\n'.join(doc_lines))
-        if doc_seq % 1000 == 0:
-            filename = "batch{:02d}.dat".format(batch_seq)
+        doc_seq += 1
+        if mode == 'batch':
+            if doc_seq % 1000 == 0:
+                filename = "batch{:02d}.trectext".format(batch_seq)
+                with open(os.path.join(output_path, filename), 'w') as out_f:
+                    out_f.write('\n\n'.join(doc_content))
+                doc_content = []
+                batch_seq += 1
+        else:
+            filename = data['DOCNO'] + '.trectext'
             with open(os.path.join(output_path, filename), 'w') as out_f:
-                out_f.write('\n\n'.join(doc_content))
+                out_f.write('\n'.join(doc_content))
             doc_content = []
-            batch_seq += 1
+
     # write out the rest
-    if len(doc_content) > 0:
-        filename = "batch{:02d}.dat".format(batch_seq)
+    if mode == 'batch' and len(doc_content) > 0:
+        filename = "batch{:02d}.trectext".format(batch_seq)
         with open(os.path.join(output_path, filename), 'w') as out_f:
             out_f.write('\n\n'.join(doc_content))
+        pass
 
-    return file
+    return doc_seq, batch_seq, empty_count
 
 
 def run():
+    """create batches of trectext files"""
     assert os.path.exists(args.input_path), "input_path doesn't exist"
     assert os.path.exists(args.output_path), "output_path doesn't exist"
 
@@ -112,14 +131,22 @@ def run():
             if not file.endswith('gz') and not file.endswith('xml'):
                 continue
             doc_files.append(os.path.join(root, file))
-    logger.info('{} medline files found from {}'
-                ''.format(len(doc_files), args.input_path))
+    print('{} medline files found from {}'
+          ''.format(len(doc_files), args.input_path))
 
-    logger.info('converting...')
+    print('converting...')
     pool = Pool(processes=args.num_workers)
-    for f in tqdm(pool.imap_unordered(convert, doc_files),
-                  total=len(doc_files)):
-        pass
+    total_doc = 0
+    total_batch = 0
+    total_empty = 0
+    for d, b, n in tqdm(pool.imap_unordered(partial(convert), doc_files),
+                        total=len(doc_files)):
+        total_doc += d
+        total_batch += b
+        total_empty += n
+
+    print('total docs: {}, total batches: {} created (empty doc {})'
+          ''.format(total_doc, total_batch, total_empty))
 
 
 if __name__ == '__main__':
@@ -130,13 +157,5 @@ if __name__ == '__main__':
                         help='number of processes for converting')
     args = parser.parse_args()
 
-    # initialize logger
-    logger = logging.getLogger()
-    logger.setLevel(logging.INFO)
-    fmt = logging.Formatter('%(asctime)s: [ %(message)s ]',
-                            '%m/%d/%Y %I:%M:%S %p')
-    console = logging.StreamHandler()
-    console.setFormatter(fmt)
-    logger.addHandler(console)
-
+    mode = 'batch'  # 'all' or 'batch'
     run()

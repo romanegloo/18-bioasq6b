@@ -39,7 +39,7 @@ def add_arguments(parser):
                          help="Use DataParallel on all available GPUs")
     runtime.add_argument('--num-epochs', type=int, default=30,
                          help='Train data iterations')
-    runtime.add_argument('--batch-size', type=int, default=64,
+    runtime.add_argument('--batch-size', type=int, default=256,
                          help='batch size for training')
     runtime.add_argument('--print-parameters', action='store_true',
                          help='Print out model parameters')
@@ -50,6 +50,8 @@ def add_arguments(parser):
     files = parser.add_argument_group('Files')
     files.add_argument('--data-dir', type=str,
                        help='Path to the directory containing test/train files')
+    files.add_argument('--year', type=int, default=None,
+                       help='Year of test; Datafiles for specific year is used')
     files.add_argument('--var-dir', type=str,
                        help='Path to var directory; log files stored')
     files.add_argument('--train-file', type=str,
@@ -148,9 +150,9 @@ def prepare_dataloader():
     global args
     logger.info('-' * 100)
     logger.info('Loading Datasets...')
-    train_ex = utils.load_data(os.path.join(args.data_dir, 'train'))
+    train_ex = utils.load_data(os.path.join(args.data_dir, 'train'), args.year)
     logger.info('{} train examples loaded'.format(len(train_ex)))
-    test_ex = utils.load_data(os.path.join(args.data_dir, 'test'))
+    test_ex = utils.load_data(os.path.join(args.data_dir, 'test'), args.year)
     logger.info('{} test examples loaded'.format(len(test_ex)))
 
     logger.info('Building feature dictionary...')
@@ -226,12 +228,12 @@ def validate(args, data_loader, model, global_stats, mode):
     examples = 0
     for ex in data_loader:
         batch_size = ex[0].size(0)
-        scores = model.predict(ex)[0]
+        scores = model.predict(ex)
         pred = scores.max(1)[1]
         acc_ = torch.LongTensor(ex[-2]).eq(pred.data.cpu()).sum() / batch_size
         acc.update(acc_, batch_size)
 
-        # If getting train accuracies, sample max 10k
+        # If getting train accuracies, limit no of examples to validate
         examples += batch_size
         if mode == 'train' and examples >= 5e3:
             break
@@ -357,10 +359,11 @@ if __name__ == '__main__':
                             ''.format(stats['best_valid'], stats['epoch'],
                                       model.updates))
                 # save the best model
-                model_file = os.path.join(
-                    args.var_dir,
-                    '{}-best-acc{:d}.mdl'.format(args.run_name,
-                                                 stats['best_valid'] * 100))
+                model_file = \
+                    os.path.join(args.var_dir,
+                                 '{}-best-acc{:d}.mdl'
+                                 ''.format(args.run_name,
+                                           int(stats['best_valid'] * 100)))
                 model.save(model_file)
         except KeyboardInterrupt:
             logger.warning('Training loop terminated')

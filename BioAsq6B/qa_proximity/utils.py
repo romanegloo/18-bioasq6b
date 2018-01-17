@@ -159,13 +159,16 @@ def batchify(batch):
 # helper functions
 # ------------------------------------------------------------------------------
 
-def load_data(data_dir):
+def load_data(data_dir, year=None):
     """Load examples from preprocessed file.
     One example per line, JSON encoded.
     """
     examples = []
     # read all of relevant and irrelevant data
-    files = ['rel.txt', 'irrel.txt']
+    if year is None:
+        files = ['rel.txt', 'irrel.txt']
+    else:
+        files = ['rel-t{}.txt'.format(year), 'irrel-t{}.txt'.format(year)]
     for file in files:
         with open(os.path.join(data_dir, file)) as f:
             examples.extend([json.loads(line) for line in f])

@@ -41,7 +41,10 @@ def avg_precision(y_true, y_pred):
     else:
         return ap_num / min(len(y_true), len(y_pred))
 
-def measure_performance(y_true, y_pred):
+
+def measure_performance(y_true, y_pred, cutoff=None):
+    if len(y_pred) > cutoff:
+        y_pred = y_pred[:cutoff]
     precision_ = precision(y_true, y_pred)
     recall_ = recall(y_true, y_pred)
     F1 = f_measure(precision_, recall_)
