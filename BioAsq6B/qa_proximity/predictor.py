@@ -24,25 +24,23 @@ class Predictor(object):
     def _set_q(self, q):
         self.q_ex, self.q_f, self.q_mask = self._encode_ex(q)
 
-    def predict_prob(self, context, question=None):
+    def predict_prob(self, context, question=None, tokens=None, scores=None):
         if question:
             self._set_q(question)
-        ex = self._build_ex(context)
+        ex = self._build_ex(context, tokens)
         pred = self.model.predict(ex)
-        return F.softmax(pred, 1).data.squeeze()
+        res = F.softmax(pred, 1).data.squeeze()
+        if scores is not None:
+            scores.append(res[1])
+        return res
 
-    # def predict(self, question, context):
-    #     ex = self._build_ex(question, context)
-    #     pred = self.model.predict(ex)
-    #     print('{:.2f} percent relevant'
-    #           ''.format(F.softmax(pred, 1).data.squeeze()[1] * 100))
-
-    def _encode_ex(self, sent):
-        s_ = self.nlp(sent)
+    def _encode_ex(self, sent, tokens=None):
+        if tokens is None:
+            tokens = self.nlp(sent)
         ex = dict()
-        ex['context'] = [t.text.lower() for t in s_]
-        ex['pos'] = [t.pos_ for t in s_]
-        ex['ner'] = [t.ent_type_ for t in s_]
+        ex['context'] = [t.text.lower() for t in tokens]
+        ex['pos'] = [t.pos_ for t in tokens]
+        ex['ner'] = [t.ent_type_ for t in tokens]
 
         ft_len = len(self.model.feature_dict)
         ex_len = len(ex['context'])
@@ -65,10 +63,10 @@ class Predictor(object):
         x1_f = x1_f.unsqueeze(0)
         return x1, x1_f, x1_mask
 
-    def _build_ex(self, context):
+    def _build_ex(self, context, tokens=None):
         """Essentially using the same process of building datasets (utils.py
         and prepare_dataset.py) """
-        x2, x2_f, x2_mask = self._encode_ex(context)
+        x2, x2_f, x2_mask = self._encode_ex(context, tokens)
         return self.q_ex, self.q_f, self.q_mask, x2, x2_f, x2_mask
 
 

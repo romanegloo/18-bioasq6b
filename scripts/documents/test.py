@@ -24,6 +24,9 @@ console = logging.StreamHandler()
 console.setFormatter(fmt)
 logger.addHandler(console)
 
+# ------------------------------------------------------------------------------
+# Set Options
+# ------------------------------------------------------------------------------
 parser = argparse.ArgumentParser()
 parser.add_argument('-y', '--year', type=int, default=4, choices=[1,2,3,4,5,6],
                     help='The year of the data to test on')
@@ -161,7 +164,8 @@ def _run(q, table):
         rel_scores = re_ranker.get_prox_scores(docids, q)
 
         # Compute final scores; merge_scores returns list of OrderedDict
-        results = re_ranker.merge_scores(docids, ret_scores, rel_scores)
+        results = re_ranker.merge_scores(args.score_weights, docids,
+                                         ret_scores, rel_scores)
     else:
         ranked_list = {}
         ret_scores_norm = \

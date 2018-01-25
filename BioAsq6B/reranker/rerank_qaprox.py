@@ -5,12 +5,12 @@ import subprocess
 import os
 import spacy
 import logging
-from tqdm import tqdm
 from collections import OrderedDict
 import numpy as np
-import math
+from threading import Thread
 
 from .. import DATA_DIR
+from .. import common
 from ..qa_proximity import Predictor
 
 logger = logging.getLogger(__name__)
@@ -18,10 +18,6 @@ logger = logging.getLogger(__name__)
 class RerankQaProx(object):
     def __init__(self, args):
         self.args = args
-        if args.score_lambda:
-            self.score_lambda = args.score_lambda
-        else:
-            self.score_lambda = 1.5
         self.idx_dir = os.path.join(DATA_DIR, 'galago-medline-full-idx')
         logger.info('loading spacy nlp tools...')
         self.nlp = spacy.load('en')
@@ -38,16 +34,23 @@ class RerankQaProx(object):
 
     def get_prox_scores(self, docids, q):
         """Compute the QA_Proximity scores over the list of documents"""
-        logger.info('analyzing qa relevance of qid #{}'.format(q['id']))
+        if self.args.verbose:
+            logger.info('analyzing qa relevance of qid #{}'.format(q['id']))
         rel_scores = []
         self.predictor._set_q(q['body'])
-        for docid in tqdm(docids):
+        for docid in docids:
             # Proximity score will be the sum of the average prox scores and
             # the the best median of 3 consecutive scores.
             scores = []
-            for sent in self.get_sentence(docid):
-                prob = self.predictor.predict_prob(sent)
-                scores.append(prob[1])
+            threads = []
+            for sent, tokens in self.get_sentence(docid):
+                t = Thread(target=self.predictor.predict_prob, args=(sent, ),
+                           kwargs={'tokens': tokens, 'scores': scores})
+                threads.append(t)
+                t.start()
+            for i, t in enumerate(threads):
+                t.join()
+
             if len(scores) < 2:  # penalize an empty (or short) document
                 rel_scores.append((0.1, 0.1, 0.1))
                 continue
@@ -61,6 +64,8 @@ class RerankQaProx(object):
             if best_median == 0:
                 best_median = avg_score
             rel_scores.append((avg_score, best_median, max_score))
+            if self.args.verbose:
+                print("reranking {} analyzed".format(docid))
         return rel_scores
 
     def get_sentence(self, docid):
@@ -70,7 +75,7 @@ class RerankQaProx(object):
             return
         s_ = self.nlp(text)
         for sent in s_.sents:
-            yield sent.text
+            yield sent.text, s_[sent.start:sent.end]
 
     def read_doc_text(self, docid):
         p = subprocess.run(['galago', 'doc', '--index={}'.format(self.idx_dir),
@@ -90,7 +95,9 @@ class RerankQaProx(object):
         text = doc[start:end] + ' ' + text
         return text
 
-    def merge_scores(self, docids, ret_scores, rel_scores):
+    @staticmethod
+    def merge_scores(weights, docids, ret_scores, rel_scores):
+        score_weights = list(map(float, weights.split(',')))
         def _softmax(x):
             return np.exp(x) / np.sum(np.exp(x), axis=0)
         ranked_list = {}
@@ -100,16 +107,17 @@ class RerankQaProx(object):
             ranked_list[d] = {'ret_score': ret_scores[i]}
             try:
                 ranked_list[d]['avg_rel_scores'] = \
-                    np.average(rel_scores[i], weights=[1, 3, 0.2])
+                    np.average(rel_scores[i], weights=score_weights[:3])
             except TypeError:
                 print(rel_scores[i])
                 raise
             ranked_list[d]['rel_scores'] = rel_scores[i]
             ranked_list[d]['ret_score_norm'] = ret_scores_norm[i]
             ranked_list[d]['score'] = \
-                self.score_lambda * ranked_list[d]['ret_score_norm'] + \
-                1 * ranked_list[d]['avg_rel_scores']
+                score_weights[3] * ranked_list[d]['ret_score_norm'] + \
+                score_weights[4] * ranked_list[d]['avg_rel_scores']
         # Sort
         results = OrderedDict(sorted(ranked_list.items(),
                                      key=lambda t: t[1]['score'], reverse=True))
         return results
+
