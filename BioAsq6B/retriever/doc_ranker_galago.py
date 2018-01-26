@@ -63,6 +63,7 @@ class GalagoRanker(object):
             json.dump(q_obj, fp=out_f, indent=4, separators=(',', ': '))
 
         # run galago
+        # todo. need to handle failure cases better
         p = subprocess.run(['galago', 'batch-search', fp],
                            stdout=subprocess.PIPE)
         if os.path.exists(fp):

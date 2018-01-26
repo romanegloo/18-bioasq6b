@@ -9,12 +9,13 @@ import prettytable
 import random
 import re
 import math
-from multiprocessing import Pool
+from multiprocessing import Pool, Manager
 from datetime import datetime
 from termcolor import colored
 import numpy as np
 import logging
 from pathlib import PosixPath
+import pickle
 # import traceback   # may need to use this to get the traceback generated
 # from inside a thread or process
 
@@ -34,7 +35,24 @@ questions = []
 
 
 def init():
-    global doc_ranker, re_ranker, questions
+    global doc_ranker, re_ranker, questions, cached_scores
+
+    # Read cached QA_prox scores for faster evaluation
+    if args.cache_scores:
+        manager = Manager()
+        if os.path.isfile(args.score_datafile):
+            # Confirm if a user wants to read the cached scores, or start
+            # from the scratch
+            ans = input("Existing cached scores found. Do you want to read "
+                        "[Y/n]? ")
+            if ans.lower().startswith('n'):
+                args.cached_scores = manager.dict()
+            else:
+                with open(args.score_datafile, 'rb') as f:
+                    scores = pickle.load(f)
+                args.cached_scores = manager.dict(scores)
+        else:
+            args.cached_scores = manager.dict()
 
     logger.info('Initializing retriever...')
     doc_ranker = retriever.get_class('galago')(args)
@@ -88,7 +106,8 @@ def sample_questions():
     if args.qids:
         pass  # not implemented yet
     else:
-        random.seed()
+        if args.random_seed is not None:
+            random.seed(args.random_seed)
         samples = random.sample(questions, sample_size)
     logger.info('# of questions: {}, sample size: {}'
                 ''.format(len(questions), sample_size))
@@ -163,7 +182,13 @@ def _write_result(res, fp=None, stats=None):
     return
 
 
-def run(questions, epoch):
+def run(questions, epoch_no):
+    def _log_results(res):
+        """callback function for running _query()"""
+        # res_container.append(res)
+        with open(args.logfile, 'a') as f:
+            _write_result(res, f, stats)
+
     run_time = Timer()
     stats = {
         'avg_prec': AverageMeter(),
@@ -172,14 +197,6 @@ def run(questions, epoch):
         'map': AverageMeter(),
         'logp': AverageMeter()
     }
-
-    # res_container = []
-    def _log_results(res):
-        """callback function for running _query()"""
-        # res_container.append(res)
-        with open(args.logfile, 'a') as f:
-            _write_result(res, f, stats)
-
     p = Pool(10)
     for seq, q in enumerate(questions):
         p.apply_async(_query, args=(q,), callback=_log_results)
@@ -187,47 +204,62 @@ def run(questions, epoch):
     p.join()
 
     gmap = math.exp(stats['logp'].avg)
-    report = '[batch #{} (run_time: {})]\n'.format(epoch, run_time.time())
-    report += 'mean_precision: %.4f, mean_recall: %.4f, mean_f1: %.4f' % \
-              (stats['avg_prec'].avg, stats['avg_recall'].avg,
-               stats['avg_f1'].avg)
-    report += '\nmap: {:.4f}, gmap: {:.4f}'.format(stats['map'].avg, gmap)
+    report = ("[batch #{} (run_time: {})]\n"
+              "mean_precision: {:.4f}, mean_recall: {:.4f}, mean_f1: {:.4f} "
+              "map: {:.4f}, gmap: {:.4f}"
+              ).format(epoch_no, run_time.time(), stats['avg_prec'].avg,
+                       stats['avg_recall'].avg, stats['avg_f1'].avg,
+                       stats['map'].avg, gmap)
+    with open(args.logfile, 'a') as f:
+        f.write(report)
     print(report)
+
+    # if caching score is enabled, store the scores
+    if args.cache_scores:
+        print(args.cached_scores)
+        print('scores cached')
+        pickle.dump(dict(args.cached_scores), open(args.score_datafile, 'wb'))
 
     return stats['map'].avg
 
 
 def optimize():
+    """records: """
     num_epoch = 30
     scores = []
+    def _print_scores():
+        # print best 5
+        report = ''
+        scores_sorted = sorted(scores, key=lambda t: t[0], reverse=True)
+        for v in scores_sorted[:5]:
+            report += '\nBEST: [map: {:.4f}, params: {}]'.format(v[0], v[1])
+        print(report)
+        with open(args.logfile, 'a') as f:
+            f.write(report + '\n')
+
     for i in range(num_epoch):
         # Sample the questions, if necessary
         samples = sample_questions()
 
         # Set hyperparameters; Override args.score_weights
+        np.random.seed()
         rel_score_weights = np.random.uniform(low=0.1, high=0.9, size=3)
         rel_score_weights = \
             (rel_score_weights / rel_score_weights.sum()).tolist()
-        hyper_weights = np.random.uniform(low=0.1, high=0.9, size=2)
+        hyper_weights = np.random.uniform(size=2)
         hyper_weights = (hyper_weights / hyper_weights.sum()).tolist()
         args.score_weights = ','.join(
             ['{:.2f}'.format(w) for w in (rel_score_weights + hyper_weights)])
         print('parameters: ', args.score_weights)
 
         # Run
-        map = run(samples, i)
-        scores.append((map, args.score_weights))
-
-    # print best 5
-    report = ''
-    for i, v in sorted(enumerate(scores), key=lambda t: t[1][0], reverse=True):
-        if i >= 5:
-            break
-        report += '\nBEST: [map: {:.4f}, params: {}]'.format(v[0], v[1])
-
-    print(report)
-    with open(args.logfile, 'a') as f:
-        f.write(report)
+        try:
+            map = run(samples, i)
+            scores.append((map, args.score_weights))
+        except KeyboardInterrupt:
+            _print_scores()
+            raise
+        _print_scores()
 
 
 if __name__ == '__main__':
@@ -248,6 +280,8 @@ if __name__ == '__main__':
                         help='Document retrieval model')
     parser.add_argument('--rerank', action='store_true',
                         help='Enable re-ranker using qa_proximity model')
+    parser.add_argument('-c', '--cache-scores', action='store_true',
+                        help='Enable caching of the qa_prox scores')
     parser.add_argument('--qaprox-model', type=str,
                         help='Path to a QA_Proximity model')
     parser.add_argument('--ndocs', type=int, default=10,
@@ -256,6 +290,8 @@ if __name__ == '__main__':
                         default='0.24,0.71,0.05,0.75,0.25',
                         help='Weights of scoring function;'
                              '[alpha,beta,gamma,lambda,mu]')
+    parser.add_argument('--random-seed', type=int, default=None,
+                        help='set a random seed for sampling operations')
     parser.add_argument('-l', '--logfile', type=str, default=None,
                         help='Filename to which retrieval results are saved')
     parser.add_argument('-v', '--verbose', action='store_true',
@@ -266,10 +302,8 @@ if __name__ == '__main__':
     args.run_id = datetime.today().strftime("%b%d-%H%M")
     DATA_DIR = os.path.join(
         PosixPath(__file__).absolute().parents[3].as_posix(), 'data')
-    # DATA_DIR = os.path.join(os.path.dirname(__file__), '../../../data')
     RUNS_DIR = os.path.join(
         PosixPath(__file__).absolute().parents[3].as_posix(), 'runs')
-    # RUNS_DIR = os.path.join(os.path.dirname(__file__), '../../../runs')
     args.test_dir = os.path.join(DATA_DIR, 'bioasq/test')
     args.train_dir = os.path.join(DATA_DIR, 'bioasq/train')
     args.index_path = os.path.join(DATA_DIR, 'galago-medline-full-idx')
@@ -280,6 +314,9 @@ if __name__ == '__main__':
         args.logfile = os.path.join(RUNS_DIR, args.run_id + ".log")
     else:
         args.logfile = os.path.join(RUNS_DIR, args.logfile)
+    if args.cache_scores:
+        args.score_datafile = os.path.join(DATA_DIR,
+                                           'qa_prox/var/qa_scores.pkl')
 
     init()
     optimize()

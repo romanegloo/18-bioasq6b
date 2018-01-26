@@ -39,6 +39,14 @@ class RerankQaProx(object):
         rel_scores = []
         self.predictor._set_q(q['body'])
         for docid in docids:
+            if self.args.cache_scores:
+                # check if cached score exists
+                key = q['id'] + '-' + docid
+                if key in self.args.cached_scores:
+                    rel_score = self.args.cached_scores[key]
+                    rel_scores.append(rel_score)
+                    continue
+
             # Proximity score will be the sum of the average prox scores and
             # the the best median of 3 consecutive scores.
             scores = []
@@ -52,18 +60,22 @@ class RerankQaProx(object):
                 t.join()
 
             if len(scores) < 2:  # penalize an empty (or short) document
-                rel_scores.append((0.1, 0.1, 0.1))
-                continue
-            avg_score = np.mean(scores)
-            max_score = np.max(scores)
-            best_median = 0
-            for i in range(len(scores)-2):
-                median = np.median(scores[i:i+3])
-                if best_median < median:
-                    best_median = median
-            if best_median == 0:
-                best_median = avg_score
-            rel_scores.append((avg_score, best_median, max_score))
+                rel_score = (0.1, 0.1, 0.1)
+            else:
+                avg_score = np.mean(scores)
+                max_score = np.max(scores)
+                best_median = 0
+                for i in range(len(scores)-2):
+                    median = np.median(scores[i:i+3])
+                    if best_median < median:
+                        best_median = median
+                if best_median == 0:
+                    best_median = avg_score
+                rel_score = (avg_score, best_median, max_score)
+            rel_scores.append(rel_score)
+            if self.args.cache_scores:
+                key = q['id'] + '-' + docid
+                self.args.cached_scores[key] = rel_score
             if self.args.verbose:
                 print("reranking {} analyzed".format(docid))
         return rel_scores
