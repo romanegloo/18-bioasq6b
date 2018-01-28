@@ -16,12 +16,13 @@ from ..qa_proximity import Predictor
 logger = logging.getLogger(__name__)
 
 class RerankQaProx(object):
-    def __init__(self, args):
+    def __init__(self, args, cached_scores=None):
         self.args = args
         self.idx_dir = os.path.join(DATA_DIR, 'galago-medline-full-idx')
         logger.info('loading spacy nlp tools...')
         self.nlp = spacy.load('en')
         self.predictor = Predictor(args)
+        self.cached_scores = cached_scores
 
     def batch_get_prox_scores(self, lst_docids, questions):
         """Get QA_Proximity scores in batch; return the list of rel_scores"""
@@ -42,8 +43,8 @@ class RerankQaProx(object):
             if self.args.cache_scores:
                 # check if cached score exists
                 key = q['id'] + '-' + docid
-                if key in self.args.cached_scores:
-                    rel_score = self.args.cached_scores[key]
+                if key in self.cached_scores:
+                    rel_score = self.cached_scores[key]
                     rel_scores.append(rel_score)
                     continue
 
@@ -75,7 +76,7 @@ class RerankQaProx(object):
             rel_scores.append(rel_score)
             if self.args.cache_scores:
                 key = q['id'] + '-' + docid
-                self.args.cached_scores[key] = rel_score
+                self.cached_scores[key] = rel_score
             if self.args.verbose:
                 print("reranking {} analyzed".format(docid))
         return rel_scores

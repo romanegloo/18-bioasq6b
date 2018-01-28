@@ -16,12 +16,13 @@ logger = logging.getLogger(__name__)
 
 
 class GalagoRanker(object):
-    def __init__(self, args, ngrams=2):
+    def __init__(self, args, ngrams=2, cached_retrievals=None):
         self.args = args
         self.index_path = args.index_path
         self.db_path = args.database
         self.tokenizer = DEFAULTS['tokenizer']()
         self.ngrams = ngrams
+        self.cached_retrievals = cached_retrievals
 
     def batch_closest_docs(self, queries, k=10):
         """parse batch queries, run doc ranker, and return the list of ranked
@@ -50,6 +51,11 @@ class GalagoRanker(object):
 
     def closest_docs(self, query, k=10):
         """Closest docs for one query"""
+        # Check if cached retrieval results are being used.
+        if self.cached_retrievals:
+            key = query['id'] + '-' + str(k)
+            if key in self.cached_retrievals:
+                return self.cached_retrievals[key]
         if self.args.query_model == 'sdm':
             q_obj = self.query_sdm([query], k)
         elif self.args.query_model == 'rm':
@@ -71,7 +77,11 @@ class GalagoRanker(object):
 
         if self.args.verbose:
             print(p.stdout.decode('utf-8'))
-        return self._extract_id_scores(p.stdout.decode('utf-8'))
+        scores = self._extract_id_scores(p.stdout.decode('utf-8'))
+        if self.args.cache_retrieval:
+            key = query['id'] + '-' + str(k)
+            self.cached_retrievals[key] = scores
+        return scores
 
     def query_sdm(self, queries, k=1):
         q_tmpl = {
@@ -88,6 +98,11 @@ class GalagoRanker(object):
             # when using sdm or fdm, n-gram (n > 1) tokenizing is unnecessary
             ngrams = tokens.ngrams(n=1, uncased=True,
                                    filter_fn=utils.filter_ngram)
+            # todo. implement this in other query building functions
+            # To query for a hyphenated term; Galago tokenizes on hyphens
+            ngrams = ["#od:1({})".format(t.replace('-', ' '))
+                      if ('-' in t) else t for t in ngrams]
+
             # sdm component
             sdm_ = '#sdm({})'.format(' '.join(ngrams))
             # mesh

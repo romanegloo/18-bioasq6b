@@ -33,7 +33,7 @@ class SpacyTokenizer(Tokenizer):
 
     def tokenize(self, text):
         # We don't treat new lines as tokens.
-        clean_text = text.replace('\n', ' ')
+        clean_text = text.replace('\n', ' ').replace('"', ' ')
         tokens = self.nlp.tokenizer(clean_text)
         if {'lemma', 'pos', 'ner'} & self.annotators:
             self.nlp.tagger(tokens)
