@@ -12,21 +12,9 @@ import random
 from multiprocessing import Pool
 from pathlib import Path, PosixPath
 from tqdm import tqdm
-
-# path to files
-DATA_DIR = os.path.join(PosixPath(__file__).absolute().parents[3].as_posix(),
-                        'data')
-IDX_DIR = os.path.join(DATA_DIR, 'galago-medline-full-idx')
-INPUT_DIR = os.path.join(DATA_DIR, 'bioasq/train')
-OUT_DIR = os.path.join(DATA_DIR, 'qa_prox')
-
-year = 6   # either 5 or 6  (0 for debugging)
-train_infile = os.path.join(INPUT_DIR,
-                            'BioASQ-trainingDataset{}b.json'.format(year))
-test_infile = os.path.join(INPUT_DIR, 'qids_year{}.txt'.format(year-1))
-# Consider only the snippets from the allowed sections
-sections = ['title', 'abstract']
-
+import argparse
+import pickle
+import math
 
 # define helper functions
 def offset_overlaps(offset, length, spans):
@@ -105,7 +93,8 @@ def extract_irrel_from_others(irrel_sents, num):
 
 def build_dataset(data, questions, mode):
     print("Building {} dataset...".format(mode))
-    # for q in tqdm(data['questions']):
+    # Consider only the text snippets from the 'title' and 'abstract'
+    sections = ['title', 'abstract']
     for q in tqdm(data['questions']):
         if 'snippets' not in q:
             continue
@@ -158,7 +147,7 @@ def build_dataset(data, questions, mode):
                 rec['pos'] = [t.pos_ for t in s_]
                 rec['ner'] = [t.ent_type_ for t in s_]
                 with open(os.path.join(OUT_DIR, mode,
-                                       'rel-t{}.txt'.format(year)), 'a') as f:
+                                    'rel-t{}.txt'.format(args.year)), 'a') as f:
                     f.write(json.dumps(rec) + '\n')
 
         # Parse irrelevant examples
@@ -168,7 +157,7 @@ def build_dataset(data, questions, mode):
         # randomly selected pubmed documents (which assumed to be irrelevant
         # by chance)
         irrel_sents = []
-        extract_irrel_from_pool(rel_offsets, irrel_sents, int(cnt_rel/2))
+        extract_irrel_from_pool(rel_offsets, irrel_sents, int(cnt_rel * .3))
         extract_irrel_from_others(irrel_sents, cnt_rel - len(irrel_sents))
         # # Sample the same number of irrelevant examples
         for sent in irrel_sents:
@@ -184,33 +173,68 @@ def build_dataset(data, questions, mode):
             rec['pos'] = [t.pos_ for t in s_]
             rec['ner'] = [t.ent_type_ for t in s_]
             with open(os.path.join(OUT_DIR, mode,
-                                   'irrel-t{}.txt'.format(year)), 'a+') as f:
+                                 'irrel-t{}.txt'.format(args.year)), 'a+') as f:
                 f.write(json.dumps(rec) + '\n')  # write out
 
 
 if __name__ == '__main__':
-    # load spacy nlp
+    parser = argparse.ArgumentParser()
+    parser.add_argument('-y', '--year', type=int, default=5, choices=[5,6],
+                        help='The year of the BioASQ training dataset')
+    args = parser.parse_args()
+
+    # Set defaults
+    DATA_DIR = os.path.join(
+        PosixPath(__file__).absolute().parents[3].as_posix(), 'data')
+    IDX_DIR = os.path.join(DATA_DIR, 'galago-medline-full-idx')
+    INPUT_DIR = os.path.join(DATA_DIR, 'bioasq/train')
+    OUT_DIR = os.path.join(DATA_DIR, 'qa_prox')
+    train_infile = os.path.join(
+        INPUT_DIR, 'BioASQ-trainingDataset{}b.json'.format(args.year))
+    test_infile = os.path.join(
+        INPUT_DIR, 'qids_year{}.txt'.format(args.year - 1))
+    termstats_file = os.path.join(IDX_DIR, 'termstats.tsv')
+
+    # Load SpaCy NLP module
     print("Loading SpaCy 'en' module...")
     nlp = spacy.load('en')
 
-    # create directories, if not exist
+    # Read the manifest from the Galago index
+    p = subprocess.run(['galago', 'dump-index-manifest',
+                       os.path.join(IDX_DIR, 'corpus')], stdout=subprocess.PIPE)
+    manifest = json.loads(p.stdout.decode('utf-8'))
+    total_docs = manifest['keyCount']
+
+    # Read term frequency list
+    print('Reading the term-doc frequencies from the Galago index')
+    idf = dict()
+    with open(termstats_file) as f:
+        for i, l in enumerate(f):
+            t = l.split('\t')
+            if len(t) < 3:
+                continue
+            idf[str(' '.join(t[:-2]))] = math.log(total_docs / (1 + int(t[-1])))
+    # Write out idf values by terms
+    pickle.dump(idf, open(os.path.join(OUT_DIR, 'idf.p'), 'wb'))
+
+    # Read from test/training data files
+    print('Reading from bioasq training file...({})'.format(train_infile))
+    with open(train_infile) as f:
+        data = json.load(f)
+    print('Reading the test questions...({})'.format(test_infile))
+    questions = open(test_infile).read().split('\n')
+
+    # Create directories, if not exist
     for d in ['train', 'test']:
         dir = os.path.join(OUT_DIR, d)
         if not os.path.exists(dir):
             Path(dir).mkdir(parents=True)
-        rel_file = os.path.join(OUT_DIR, d, 'rel-t{}.txt'.format(year))
-        irrel_file = os.path.join(OUT_DIR, d, 'irrel-t{}.txt'.format(year))
+        rel_file = os.path.join(OUT_DIR, d, 'rel-t{}.txt'.format(args.year))
+        irrel_file = os.path.join(OUT_DIR, d, 'irrel-t{}.txt'.format(args.year))
         if os.path.exists(rel_file):
             os.remove(rel_file)
         if os.path.exists(irrel_file):
             os.remove(irrel_file)
-
-    # read from test/training data files
-    print('reading from bioasq training file...({})'.format(train_infile))
-    with open(train_infile) as f:
-        data = json.load(f)
-    print('reading the test questions...({})'.format(test_infile))
-    questions = open(test_infile).read().split('\n')
 
     for mode in ['train', 'test']:
         build_dataset(data, questions, mode)

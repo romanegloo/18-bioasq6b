@@ -1,13 +1,16 @@
 #!/usr/bin/env python3
-"""Train script: runs various retrieval methods for training purpose upon
-user requests"""
+"""(Note. This file is merged into run.py)
+Train script: runs various retrieval methods for training purpose upon user
+requests"""
 import argparse
 import os
+import sys
 import json
 import prettytable
 import random
 import re
 import math
+import multiprocessing
 from multiprocessing import Pool, Manager
 from datetime import datetime
 from termcolor import colored
@@ -24,12 +27,6 @@ from BioAsq6B import retriever, reranker
 from BioAsq6B.common import Timer, AverageMeter, measure_performance
 
 logger = logging.getLogger()
-logger.setLevel(logging.INFO)
-fmt = logging.Formatter('%(asctime)s: [ %(message)s ]', '%m/%d/%Y %I:%M:%S %p')
-console = logging.StreamHandler()
-console.setFormatter(fmt)
-logger.addHandler(console)
-
 doc_ranker = None
 re_ranker = None
 questions = []
@@ -38,6 +35,22 @@ questions = []
 def init():
     global doc_ranker, re_ranker, questions
 
+    logger.setLevel(logging.DEBUG)
+    # also use this logger in the multiprocessing module
+    mlp = multiprocessing.log_to_stderr()
+    mlp.setLevel(logging.WARN)
+    fmt = logging.Formatter('%(asctime)s: [ %(message)s ]', '%m/%d/%Y %I:%M:%S %p')
+    if args.verbose:
+        console = logging.StreamHandler()
+        console.setFormatter(fmt)
+        logger.addHandler(console)
+    else:
+        file = logging.FileHandler(args.logfile)
+        file.setFormatter(fmt)
+        logger.addHandler(file)
+        print("writing output in {}".format(args.logfile))
+    logger.info('COMMAND: %s' % ' '.join(sys.argv))
+
     # Read cached QA_prox scores for faster evaluation
     cached_scores = None
     if args.cache_scores:
@@ -45,11 +58,12 @@ def init():
         if os.path.isfile(args.score_datafile):
             # Confirm if a user wants to read the cached scores, or start
             # from the scratch
-            ans = input("Existing cached scores found. Do you want to read "
+            ans = input("Cached proximity scores exist. Do you want to read "
                         "[Y/n]? ")
             if ans.lower().startswith('n'):
                 cached_scores = manager.dict()
             else:
+                print('Reading the scores: {}'.format(args.score_datafile))
                 with open(args.score_datafile, 'rb') as f:
                     scores = pickle.load(f)
                 cached_scores = manager.dict(scores)
@@ -59,7 +73,7 @@ def init():
     #  question pools
     cached_retrievals = None
     if args.cache_retrieval:
-        print('cache_retrieval created')
+        logger.info('cache_retrieval created')
         manager = Manager()
         cached_retrievals = manager.dict()
 
@@ -69,6 +83,20 @@ def init():
     if args.rerank:
         logger.info('Initializing re-ranker...')
         re_ranker = reranker.RerankQaProx(args, cached_scores=cached_scores)
+        if args.print_parameters:
+            from BioAsq6B.qa_proximity import utils
+            model_summary = utils.torch_summarize(re_ranker.predictor.model)
+            logger.info(model_summary)
+        # check if the model needs to load idf data
+        if re_ranker.predictor.model.args.use_idf:
+            idf_file = os.path.join(DATA_DIR, 'qa_prox/idf.p')
+            try:
+                idf = pickle.load(open(idf_file, 'rb'))
+            except:
+                logger.error('Failed to read idf file from {}'.format(idf_file))
+                raise
+            logger.info('Using idf feature: {} loaded'.format(len(idf)))
+            re_ranker.predictor.idf = idf
 
     # --------------------------------------------------------------------------
     # Read question/answer datasets
@@ -114,7 +142,10 @@ def sample_questions():
 
     if args.qids is None:
         if args.random_seed is not None:
-            random.seed(args.random_seed)
+            if args.random_seed == 0:
+                random.seed()
+            else:
+                random.seed(args.random_seed)
         samples = random.sample(questions, sample_size)
     else:
         samples = questions
@@ -123,11 +154,13 @@ def sample_questions():
     return samples
 
 
-def _query(q):
+def query(q, seq=None):
     """run retrieval procedure (optionally rerank) of one question and return
     the result"""
     results = dict()
     results['question'] = [q['id'], q['body']]
+    if seq:
+        results['seq'] = seq
     (docids, ret_scores) = doc_ranker.closest_docs(q, k=args.ndocs)
     if args.rerank:
         rel_scores = re_ranker.get_prox_scores(docids, q)
@@ -139,7 +172,6 @@ def _query(q):
         results['scores'] = OrderedDict(sorted(_scores.items(),
                                                key=lambda t: t[1]['score'],
                                                reverse=True))
-
     # Read expected documents
     results['d_exp'] = []
     for line in q['documents']:
@@ -149,7 +181,7 @@ def _query(q):
     return results
 
 
-def _write_result(res, stats=None):
+def write_result(res, stats=None):
     """Display or write the results with performance measures"""
     # Set tabular format for eval results
     table = prettytable.PrettyTable(['Question', 'GT', 'Returned', 'Scores'])
@@ -180,10 +212,16 @@ def _write_result(res, stats=None):
              'avg_precision: {:.4f}').format(prec, recall, f1, ap)
 
     # Write out
-    with open(args.logfile, 'a') as f:
-        f.write(table.get_string() + '\n')
-        f.write(report + '\n')
+    if stats is None or stats['epoch'] == 0:
+        if args.verbose:
+            print(table)
+        else:
+            with open(args.logfile, 'a') as f:
+                f.write(table.get_string() + '\n')
+                f.write(report + '\n')
         print('[#{}]'.format(res['question'][0]), report)
+    else:
+        logger.info('skip writing the retrieval results')
 
     # Update statistics
     if stats:
@@ -199,7 +237,7 @@ def run(questions, epoch_no):
     # 'examine' mode
     if args.qids is not None:
         for q in questions:
-            _write_result(_query(q))
+            write_result(query(q))
         return
 
     run_time = Timer()
@@ -208,15 +246,17 @@ def run(questions, epoch_no):
         'avg_recall': AverageMeter(),
         'avg_f1': AverageMeter(),
         'map': AverageMeter(),
-        'logp': AverageMeter()
+        'logp': AverageMeter(),
+        'epoch': epoch_no
     }
 
     # Callback function to write the results of queries
-    cb_write_results = partial(_write_result, stats=stats)
+    cb_write_results = partial(write_result, stats=stats)
     # Generate Pool for multiprocessing
-    p = Pool(10)
+    p = Pool(8)
     for seq, q in enumerate(questions):
-        p.apply_async(_query, args=(q,), callback=cb_write_results)
+        p.apply_async(query, args=(q, (seq, len(questions))),
+                      callback=cb_write_results)
     p.close()
     p.join()
 
@@ -234,7 +274,7 @@ def run(questions, epoch_no):
 
     # if caching score is enabled, store the scores
     if args.cache_scores:
-        print('scores cached')
+        logger.info("Proximity Scores are saved")
         pickle.dump(dict(re_ranker.cached_scores),
                     open(args.score_datafile, 'wb'))
 
@@ -249,8 +289,16 @@ def examine():
 
 
 def optimize():
-    """records: 0.12,0.19,0.69,0.81,0.19"""
-    num_epoch = 30
+    """best weights
+        with weighted sum method:
+            [0.16,0.10,0.73,0.79,0.21]
+            [0.2,.3,0.5,0.7,0.3]
+            [0.2,0.13,0.67,0.9,0.1]
+        with rrf:
+            [10,50,90,120]
+            [50,90,100,100]
+    """
+    num_epoch = 100
     scores = []
     scores_sorted = None
     def _print_scores():
@@ -258,6 +306,7 @@ def optimize():
         nonlocal scores_sorted
         report = ''
         scores_sorted = sorted(scores, key=lambda t: t[0], reverse=True)
+        print("Current parameters: {}".format(args.score_weights))
         for v in scores_sorted[:5]:
             report += '\nBEST: [map: {:.4f}, params: {}]'.format(v[0], v[1])
         print(report)
@@ -270,27 +319,50 @@ def optimize():
 
         # Set hyperparameters; Override args.score_weights
         np.random.seed()
-        if args.score_weights is None or i > 0:
-            if i % 3 == 1:
-                # fix gamma and mu
-                rel_score_weights = np.random.uniform(low=0.1, high=0.9, size=3)
-                rel_score_weights = \
-                    (rel_score_weights / rel_score_weights.sum()).tolist()
-                hyper_weights = \
-                    list(map(float, scores_sorted[0][1].split(',')[3:]))
-            elif i % 3 == 2:
-                hyper_weights = np.random.uniform(size=2)
-                hyper_weights = (hyper_weights / hyper_weights.sum()).tolist()
-                rel_score_weights = \
-                    list(map(float, scores_sorted[0][1].split(',')[:3]))
+        if args.score_fusion == 'weighted_sum':  # weighted sum of the scores
+            if args.score_weights:
+                given_weights = list(map(float, args.score_weights.split(',')))
             else:
-                rel_score_weights = np.random.uniform(low=0.1, high=0.9, size=3)
-                rel_score_weights = \
-                    (rel_score_weights / rel_score_weights.sum()).tolist()
-                hyper_weights = np.random.uniform(size=2)
-                hyper_weights = (hyper_weights / hyper_weights.sum()).tolist()
-            args.score_weights = ','.join(
-                ['{:.2f}'.format(w) for w in (rel_score_weights + hyper_weights)])
+                # Just generate random numbers, which sums up to 1
+                weights_ = np.random.random(4)
+                given_weights = weights_.tolist()
+
+            if i == 0:  # run with the given weights
+                args.score_weights = \
+                    ','.join(['{:.2f}'.format(w) for w in given_weights])
+            else:
+                best_weights = list(map(float, scores_sorted[0][1].split(',')))
+                if i % 2 == 0:  # Generate new weights
+                    weights_ = np.random.random(4)
+                else:  # Change only one of the best weights
+                    weights_ = best_weights
+                    weights_[np.random.randint(0, 3)] = np.random.random()
+                args.score_weights = ','.join(
+                    ['{:.2f}'.format(w) for w in weights_])
+        elif args.score_fusion == 'rrf':
+            # reciprocal ranks fusion
+            # : using flat scores of four modes (ret, rel_1, rel_2, rel_3)
+            population = list(range(10, 210, 10))
+            if args.score_weights:
+                print(i, args.score_weights)
+                given_weights = list(map(float, args.score_weights.split(',')))
+            else:
+                given_weights = np.random.choice(population, size=4,
+                                                 replace=True)
+
+            if i == 0:  # run with the given weights
+                args.score_weights = \
+                    ','.join(['{:.2f}'.format(w) for w in given_weights])
+            else:
+                best_weights = list(map(float, scores_sorted[0][1].split(',')))
+                if i % 2 == 0:
+                    weights_ = np.random.choice(population, size=4, replace=True)
+                else:
+                    weights_ = best_weights
+                    weights_[np.random.randint(0, 3)] = \
+                        np.random.choice(population)
+                args.score_weights = ','.join(
+                    ['{:.2f}'.format(w) for w in weights_])
         logger.info('Parameters: {}'.format(args.score_weights))
 
         # Run
@@ -302,12 +374,16 @@ def optimize():
             raise
         _print_scores()
 
+def str2bool(v):
+    return v.lower() in ('yes', 'true', 't', '1', 'y')
 
 if __name__ == '__main__':
     # --------------------------------------------------------------------------
     # Set Options
     # --------------------------------------------------------------------------
+    """define parameters with the user provided arguments"""
     parser = argparse.ArgumentParser()
+    parser.register('type', 'bool', str2bool)
     parser.add_argument('-y', '--year', type=str, default='1,2,3,4',
                         help='Comma separated list of years for training'
                              ' dataset; If you test on 4th year, '
@@ -330,14 +406,39 @@ if __name__ == '__main__':
     parser.add_argument('--ndocs', type=int, default=10,
                         help='Number of document to retrieve')
     parser.add_argument('--score-weights', type=str, default=None,
-                        help='Weights of scoring function;'
-                             '[alpha,beta,gamma,lambda,mu]')
-    parser.add_argument('--random-seed', type=int, default=None,
+                        help='comma separated weights of scoring functions')
+    parser.add_argument('--score-fusion', type=str, default='weighted_sum',
+                        choices=['weighted_sum', 'rrf'],
+                        help='Score fusion method')
+    parser.add_argument('--random-seed', type=int, default=12345,
                         help='set a random seed for sampling operations')
     parser.add_argument('-l', '--logfile', type=str, default=None,
                         help='Filename to which retrieval results are saved')
     parser.add_argument('-v', '--verbose', action='store_true',
-                        help='Verbose mode')
+                        help='Verbose mode, print without writing on a log '
+                             'file')
+    parser.add_argument('--print-parameters', action='store_true',
+                        help='Print out model parameters')
+
+    # Model Architecture: model specific options
+    model = parser.add_argument_group('Model Architecture')
+    model.add_argument('--rnn-type', type=str, default='gru',
+                       choices=['gru', 'lstm'], help='Type of the RNN')
+    model.add_argument('--embedding-dim', type=int, default=200,
+                       help='word embedding dimension')
+    model.add_argument('--hidden-size', type=int, default=128,
+                       help='GRU hidden dimension')
+    model.add_argument('--concat-rnn-layers', type='bool', default=True,
+                       help='Combine hidden states from each encoding layer')
+    model.add_argument('--num-rnn-layers', type=int, default=1,
+                       help='number of RNN layers stacked')
+    model.add_argument('--uni-direction', action='store_true', default=False,
+                       help='use single directional RNN')
+    model.add_argument('--no-token-feature', action='store_true',
+                       default=False, help='use only word embeddings')
+    model.add_argument('--use-idf', action='store_true', default=False,
+                       help='add inversed document frequency')
+
     args = parser.parse_args()
 
     # Set defaults
@@ -357,8 +458,9 @@ if __name__ == '__main__':
     else:
         args.logfile = os.path.join(RUNS_DIR, args.logfile)
     if args.cache_scores:
-        args.score_datafile = os.path.join(DATA_DIR,
-                                           'qa_prox/var/qa_scores.pkl')
+        args.score_datafile = \
+            os.path.join(DATA_DIR,
+                         'qa_prox/var/qa_scores-{}.pkl'.format(args.run_id))
 
     init()
     if args.qids is not None:

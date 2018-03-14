@@ -74,48 +74,63 @@ class Dictionary(object):
                   if k not in {'<NULL>', '<UNK>'}]
         return tokens
 
+
 # ------------------------------------------------------------------------------
 # PyTorch Dataset class for qa_proximity model
 # ------------------------------------------------------------------------------
 
 class QaProxDataset(Dataset):
-    def __init__(self, args, examples, word_dict, feature_dict):
+    def __init__(self, args, examples, word_dict, feature_dict=None, idf=None):
+        self.args = args
         self.ex = examples
         self.word_dict = word_dict
         self.feature_dict = feature_dict
+        self.idf = idf
 
     def __len__(self):
         return len(self.ex)
 
     def __getitem__(self, idx):
         ex = self.ex[idx]
-
         # Index words
-        # todo. check this part. LongTensor then batchify?
         context = torch.LongTensor([self.word_dict[w] for w in ex['context']])
         question = torch.LongTensor([self.word_dict[w] for w in ex['question']])
-
         # Create feature vector
-        feat_c = torch.zeros(len(ex['context']), len(self.feature_dict))
-        feat_q = torch.zeros(len(ex['question']), len(self.feature_dict))
-
-        # Feature POS
-        for pos in ['pos', 'q_pos']:
-            for i, w in enumerate(ex[pos]):
-                if 'pos='+w in self.feature_dict:
-                    if pos == 'pos':
-                        feat_c[i][self.feature_dict['pos='+w]] = 1.0
-                    else:
-                        feat_q[i][self.feature_dict['pos='+w]] = 1.0
-
-        # Feature NER
-        for ner in ['ner', 'q_ner']:
-            for i, w in enumerate(ex[ner]):
-                if 'pos='+w in self.feature_dict:
-                    if ner == 'ner':
-                        feat_c[i][self.feature_dict['ner='+w]] = 1.0
-                    else:
-                        feat_q[i][self.feature_dict['ner='+w]] = 1.0
+        feat_c = feat_q = None
+        if not self.args.no_token_feature:
+            feature_len = len(self.feature_dict)
+            if self.args.use_idf:
+                feature_len += 1
+            feat_c = torch.zeros(len(ex['context']), feature_len)
+            feat_q = torch.zeros(len(ex['question']), feature_len)
+            # Feature POS
+            for pos in ['pos', 'q_pos']:
+                for i, w in enumerate(ex[pos]):
+                    if 'pos='+w in self.feature_dict:
+                        if pos == 'pos':
+                            feat_c[i][self.feature_dict['pos='+w]] = 1.0
+                        else:
+                            feat_q[i][self.feature_dict['pos='+w]] = 1.0
+            # Feature NER
+            for ner in ['ner', 'q_ner']:
+                for i, w in enumerate(ex[ner]):
+                    if 'pos='+w in self.feature_dict:
+                        if ner == 'ner':
+                            feat_c[i][self.feature_dict['ner='+w]] = 1.0
+                        else:
+                            feat_q[i][self.feature_dict['ner='+w]] = 1.0
+            # IDF
+            if self.args.use_idf:
+                for i, w in enumerate(ex['context']):
+                    try:
+                        feat_c[i][-1] = self.idf[w.lower()]
+                    except KeyError:
+                        feat_c[i][-1] = 0
+                for i, w in enumerate(ex['question']):
+                    try:
+                        feat_q[i][-1] = self.idf[w.lower()]
+                    except KeyError:
+                        feat_q[i][-1] = 0
 
         return context, feat_c, question, feat_q, ex['label'], ex['qid']
 
@@ -129,25 +144,34 @@ def batchify(batch):
     y = [ex[4] for ex in batch]
     qids = [ex[5] for ex in batch]
 
+    # In case of no_token_feature, ignore token features
+    no_token_feature = (features_c[0] is None)
+
     # Batch documents and features
     max_length = max([c.size(0) for c in contexts])
     x1 = torch.LongTensor(len(contexts), max_length).zero_()
     x1_mask = torch.ByteTensor(len(contexts), max_length).fill_(1)
-    x1_f = torch.zeros(len(contexts), max_length, features_c[0].size(1))
+    x1_f = None
+    if not no_token_feature:
+        x1_f = torch.zeros(len(contexts), max_length, features_c[0].size(1))
     for i, c in enumerate(contexts):
         x1[i, :c.size(0)].copy_(c)
         x1_mask[i, :c.size(0)].fill_(0)
-        x1_f[i, :c.size(0)].copy_(features_c[i])
+        if not no_token_feature:
+            x1_f[i, :c.size(0)].copy_(features_c[i])
 
     # Batch questions
     max_length = max([q.size(0) for q in questions])
     x2 = torch.LongTensor(len(questions), max_length).zero_()
     x2_mask = torch.ByteTensor(len(questions), max_length).fill_(1)
-    x2_f = torch.zeros(len(questions), max_length, features_q[0].size(1))
+    x2_f = None
+    if not no_token_feature:
+        x2_f = torch.zeros(len(questions), max_length, features_q[0].size(1))
     for i, q in enumerate(questions):
         x2[i, :q.size(0)].copy_(q)
         x2_mask[i, :q.size(0)].fill_(0)
-        x2_f[i, :q.size(0)].copy_(features_q[i])
+        if not no_token_feature:
+            x2_f[i, :q.size(0)].copy_(features_q[i])
 
     # Y
     y = torch.LongTensor(y)

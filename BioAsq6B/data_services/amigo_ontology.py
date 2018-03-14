@@ -13,7 +13,7 @@ import os
 import subprocess
 import sqlite3
 import logging
-from .. import DATA_DIR
+from .. import PATHS
 
 logger = logging.getLogger()
 
@@ -30,7 +30,7 @@ class GO_Ext(object):
             self.np_pattern = np_pattern
 
         self.chunker = nltk.RegexpParser(self.np_pattern)
-        self.db_path = os.path.join(DATA_DIR, 'var/go')
+        self.db_path = os.path.join(PATHS['data_dir'], 'var/go')
         self.db_file = os.path.join(self.db_path, 'go_query_cache.db')
         if not os.path.exists(self.db_path):
             logger.warning("GO query cache file does not exist: %s" %

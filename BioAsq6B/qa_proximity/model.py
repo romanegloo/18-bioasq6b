@@ -1,33 +1,29 @@
 #!/usr/bin/env python3
 """Model Architecture"""
 
-import logging
-import math
 import torch
 import torch.optim as optim
 import torch.nn.functional as F
 from torch.autograd import Variable
 import copy
-
 from gensim.models.keyedvectors import KeyedVectors
+import logging
+logger = logging.getLogger()
 
 from .network import QaProxBiRNN
 
-logger = logging.getLogger(__name__)
-
 
 class QaProx(object):
-    def __init__(self, args, word_dict, feature_dict, state_dict=None):
+    def __init__(self, args, word_dict, feature_dict=None, state_dict=None):
         # book-keeping
         self.args = args
         self.word_dict = word_dict
         self.feature_dict = feature_dict
-        self.args.num_features = len(feature_dict)
+        self.args.num_features = len(feature_dict) if feature_dict else 0
         self.updates = 0
         self.use_cuda = False
         self.parallel = False
         self.network = QaProxBiRNN(args)
-
         # load saved state, if exists
         if state_dict:
             self.network.load_state_dict(state_dict)
@@ -42,14 +38,17 @@ class QaProx(object):
                         'momentum: {}, weight_decay: {})'
                         ''.format(self.args.learning_rate, self.args.momentum,
                                   self.args.weight_decay))
-            self.optimizer = optim.SGD(parameters, self.args.learning_rate,
-                                       momentum=self.args.momentum,
-                                       weight_decay=self.args.weight_decay)
+            # self.optimizer = optim.SGD(parameters, self.args.learning_rate,
+            #                            momentum=self.args.momentum,
+            #                            weight_decay=self.args.weight_decay)
+            self.optimizer = optim.SGD(parameters, lr=0.01, momentum=0.9,
+                                       weight_decay=1e-6)
         elif self.args.optimizer == 'adamax':
             logger.info('Optimizer: Adamax (weight_decay: {})'
                         ''.format(self.args.weight_decay))
-            self.optimizer = optim.Adamax(parameters,
-                                          weight_decay=self.args.weight_decay)
+            # self.optimizer = optim.Adamax(parameters,
+            #                               weight_decay=self.args.weight_decay)
+            self.optimizer = optim.Adamax(parameters, lr=2e-3, weight_decay=0)
         else:
             raise RuntimeError('Unsupported optimizer: %s' %
                                self.args.optimizer)
@@ -58,8 +57,6 @@ class QaProx(object):
         """Load pre-trained embeddings for a given list of words; assume that
         the file is in word2vec binary format"""
         words = {w for w in words if w in self.word_dict}
-        logger.info('Loading pre-trained embeddings for %d words from %s' %
-                    (len(words), embedding_file))
         embedding = self.network.encoder.weight.data
         w2v_model = KeyedVectors.load_word2vec_format(embedding_file,
                                                       binary=True)
@@ -70,7 +67,6 @@ class QaProx(object):
                 embedding[self.word_dict[w]] = vec
         logger.info('Copied %d embeddings (%.2f%%)' %
                     (len(embedding), 100 * len(embedding) / len(words)))
-        w2v_model = None
 
     def update(self, ex):
         """Forward a batch of examples; step the optimizer to update weights
@@ -91,9 +87,8 @@ class QaProx(object):
 
         # Run forward
         scores = self.network(*inputs)
-
         # Compute loss and accuracies
-        loss = F.cross_entropy(scores, target)
+        loss = F.binary_cross_entropy(F.sigmoid(scores), target.float())
 
         # Clear gradients and run backward
         self.optimizer.zero_grad()
@@ -172,10 +167,11 @@ class QaProx(object):
     @staticmethod
     def load(filename):
         logger.info('Loading QA_Prox model {}'.format(filename))
-        saved_params = torch.load( filename,
+        saved_params = torch.load(filename,
                                    map_location=lambda storage, loc: storage)
         word_dict = saved_params['word_dict']
         feature_dict = saved_params['feature_dict']
         state_dict = saved_params['state_dict']
         args = saved_params['args']
+        logger.info(args)
         return QaProx(args, word_dict, feature_dict, state_dict=state_dict)

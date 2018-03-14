@@ -8,18 +8,19 @@ import tempfile
 import sqlite3
 import os
 from collections import OrderedDict
+import re
 
-from . import DEFAULTS
-from . import utils
+from . import DEFAULTS, utils
+from .. import PATHS
 
-logger = logging.getLogger(__name__)
+logger = logging.getLogger()
 
 
 class GalagoRanker(object):
     def __init__(self, args, ngrams=2, cached_retrievals=None):
         self.args = args
-        self.index_path = args.index_path
-        self.db_path = args.database
+        self.index_path = PATHS['galago_idx']
+        self.db_path = PATHS['concepts_db']
         self.tokenizer = DEFAULTS['tokenizer']()
         self.ngrams = ngrams
         self.cached_retrievals = cached_retrievals
@@ -40,10 +41,13 @@ class GalagoRanker(object):
             json.dump(q_obj, fp=out_f, indent=4, separators=(',', ': '))
 
         # run galago
-        p = subprocess.run(['galago', 'batch-search', fp],
-                           stdout=subprocess.PIPE)
-        if os.path.exists(fp):
-            os.remove(fp)
+        try:
+            p = subprocess.run(['galago', 'batch-search', fp],
+                               stdout=subprocess.PIPE)
+        finally:
+            logger.debug('removing tmp file: {}'.format(fp))
+            if os.path.exists(fp):
+                os.remove(fp)
 
         if self.args.verbose:
             print(p.stdout.decode('utf-8'))
@@ -69,9 +73,17 @@ class GalagoRanker(object):
             json.dump(q_obj, fp=out_f, indent=4, separators=(',', ': '))
 
         # run galago
-        # todo. need to handle failure cases better
-        p = subprocess.run(['galago', 'batch-search', fp],
-                           stdout=subprocess.PIPE)
+        trial = 3
+        while trial > 0:
+            p = subprocess.run(['galago', 'batch-search', fp],
+                               stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
+            if p.returncode != 0:
+                logger.error("galago execution failed {}/3".format(4-trial))
+                logger.warning(q_obj)
+                trial -= 1
+            else:
+                trial = 0
+
         if os.path.exists(fp):
             os.remove(fp)
 
@@ -83,12 +95,46 @@ class GalagoRanker(object):
             self.cached_retrievals[key] = scores
         return scores
 
+    def sanitize(self, tokens, type):
+        if type == 'band':
+            tokens_ = []
+            for t in tokens:
+                t = re.sub('[.-]', ' ', t)
+                t = re.sub('[,;()]', '', t)
+                if len(t.split()) > 1:
+                    tokens_.extend(t.split())
+                else:
+                    tokens_.append(t)
+            return tokens_
+        if type == 'ngrams':
+            tokens = [re.sub('[.]', ' ', t) for t in tokens]
+            # To query for a hyphenated term; Galago tokenizes on hyphens
+            tokens = ["#od:1({})".format(re.sub('[-]', ' ', t))
+                      if ('-' in t) else t for t in tokens]
+            return tokens
+        if type == 'mesh_desc':
+            # remove auxiliary information in a parenthesis
+            tokens = [re.sub(r"\(.*\)", '', t) for t in tokens]
+            # remove non-alphanumeric characters
+            tokens = [re.sub('[.,;()]', '', t) for t in tokens]
+            tokens = [t for t in tokens]
+            # hyphens
+            tokens = ["#od:1({})".format(re.sub('[-]', ' ', t))
+                      if ('-' in t) else t for t in tokens]
+            return tokens
+        if type == 'mesh_ui':
+            tokens = [t for t in tokens]
+            return tokens
+
+        return tokens
+
     def query_sdm(self, queries, k=1):
+        g_verbose = (self.args.qid is not None)
         q_tmpl = {
-            'verbose': self.args.verbose,
-            'casefold': False,
+            'verbose': g_verbose,
+            'casefold': True,
             'requested': k,
-            'defaultTextPart': 'postings',
+            'defaultTextPart': 'postings.krovetz',
             'index': self.index_path,
             'queries': []
         }
@@ -98,32 +144,41 @@ class GalagoRanker(object):
             # when using sdm or fdm, n-gram (n > 1) tokenizing is unnecessary
             ngrams = tokens.ngrams(n=1, uncased=True,
                                    filter_fn=utils.filter_ngram)
-            # todo. implement this in other query building functions
-            # To query for a hyphenated term; Galago tokenizes on hyphens
-            ngrams = ["#od:1({})".format(t.replace('-', ' '))
-                      if ('-' in t) else t for t in ngrams]
-
+            band_ = '#bool(#band({}))'\
+                    ''.format(' '.join(self.sanitize(ngrams, 'band')))
             # sdm component
-            sdm_ = '#sdm({})'.format(' '.join(ngrams))
+            sdm_ = '#sdm({})'.format(' '.join(self.sanitize(ngrams, 'ngrams')))
             # mesh
             ui, desc = self._mesh_ui(q['id'])
             # mesh_desc
             desc_ = []
+            desc = self.sanitize(desc, 'mesh_desc')
             for t in desc:
                 if len(t.split()) > 1:
-                    desc_.append("#inside(#od:1({}) #field:mesh_desc())"
-                                 "".format(t))
+                    desc_.append('#od:2({}).mesh_desc'.format(t))
                 else:
-                    desc_.append("#inside({} #field:mesh_desc())".format(t))
-            desc_ = "#combine({})".format(' '.join(desc_)) if len(desc_) else ''
+                    desc_.append('{}.mesh_desc'.format(t))
+            desc_c = '#band({})'.format(' '.join(desc_)) \
+                if len(desc_) else ''
             # mesh_ui
-            ui_ = ["#inside({} #field:mesh_ui())".format(t) for t in ui]
-            ui_ = "#combine({})".format(' '.join(ui_)) if len(ui_) else ''
+            ui = self.sanitize(ui, 'mesh_ui')
+            ui_ = ['{}.mesh_ui'.format(t) for t in ui]
+            ui_c = '#band({})'.format(' '.join(ui_)) if len(ui_) else ''
 
             # combine
-            q_ = "#wsum:0=5:1=1:2=4:w=1({} {} {}".format(sdm_, desc_, ui_)
-            query['text'] = q_
-            query['sdm.od.width'] = 2
+            mesh_ = "#bool({} {})".format(desc_c, ui_c) \
+                if (len(desc_c + ui_c) > 0) else ''
+            mesh_ = "#bool({})".format(ui_c) if (len(desc_c + ui_c) > 0) else ''
+            if self.args.galago_weights:
+                weights_ = list(map(float, self.args.galago_weights.split(',')))
+                q_ = '#wsum:0={}:1={}:w=1({} {})'\
+                     ''.format(*weights_, sdm_, mesh_)
+            else:
+                q_ = '#wsum:0=6:1=1:w=1({} {})'.format(sdm_, mesh_)
+            # query['text'] = q_
+            # query['text'] = "#combine({} {})".format(band_, sdm_)
+            query['text'] = sdm_
+            query['sdm.od.width'] = 3
             q_tmpl['queries'].append(query)
         return q_tmpl
 
@@ -133,7 +188,7 @@ class GalagoRanker(object):
             'verbose': self.args.verbose,
             'casefold': False,
             'index': self.index_path,
-            'defaultTextPart': 'postings',
+            'defaultTextPart': 'postings.krovetz',
             'requested': k,
             'relevanceModel':
                 "org.lemurproject.galago.core.retrieval.prf.RelevanceModel3",
@@ -223,26 +278,24 @@ class GalagoRanker(object):
     def _mesh_ui(self, qid):
         """obtain stored mesh UIs from concept DB or run metamap to get them"""
         # just use independent lists of uis and names
-        mesh_ui = []
-        mesh_desc = []
+        mesh_ui = set()
+        mesh_desc = set()
         # initialize concepts db
-        # todo. We are assuming that concepts db is prepared. In a real test
-        # case, concepts need to be obtained adaptively.
         cnx = sqlite3.connect(self.db_path)
         csr = cnx.cursor()
-        sql = "SELECT * FROM concepts WHERE id='%s';"
+        sql = "SELECT * FROM concepts2 WHERE id='%s';"
         for rec in csr.execute(sql % qid):
             # MetaMap tags
             if rec[1] == 'MetaMap':
-                mesh_ui = rec[2].split(';')
-                mesh_desc = rec[3].split(';')
+                mesh_ui |= set([c.lower() for c in rec[2].split(';')])
+                mesh_desc |= set([c.lower() for c in rec[3].split(';')])
             if rec[1].startswith('TmTag'):
                 for idx, tag in enumerate(rec[2].split(';')):
                     elms = tag.split(':')
                     if len(elms) == 3 and elms[1] == 'MESH':
                         if elms[2] not in mesh_ui:
-                            mesh_ui.append(elms[2])
-                            mesh_desc.append(rec[3].split(';')[idx])
+                            mesh_ui.add(elms[2].lower())
+                            mesh_desc.add(rec[3].split(';')[idx].lower())
 
         # append TmTags
         return mesh_ui, mesh_desc

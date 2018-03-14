@@ -1,12 +1,13 @@
 #!/usr/bin/env python3
 
 import os
-from .. import DATA_DIR
+from .. import PATHS
 from ..tokenizers import SpacyTokenizer
 
 DEFAULTS = {
     'tokenizer': SpacyTokenizer
 }
+
 
 def set_default(key, value):
     global DEFAULTS

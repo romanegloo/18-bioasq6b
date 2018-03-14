@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
-"""Test script: given the year, for example '4' for Task 4B, it runs full
+"""(Note. This file is merged into run.py)
+Test script: given the year, for example '4' for Task 4B, it runs full
 test on each batch of the year."""
 
 import argparse
@@ -15,8 +16,10 @@ import numpy as np
 import logging
 from datetime import datetime
 from pathlib import PosixPath
+import multiprocessing
 from multiprocessing import Pool
 from functools import partial
+import pickle
 
 from BioAsq6B import retriever, reranker
 from BioAsq6B.common import Timer, AverageMeter, measure_performance
@@ -31,11 +34,19 @@ def init():
     global doc_ranker, re_ranker, questions
 
     logger.setLevel(logging.INFO)
+    # Also use this logger in the multiprocessing module
+    mpl = multiprocessing.log_to_stderr()
+    mpl.setLevel(logging.WARN)
     fmt = logging.Formatter('%(asctime)s: [ %(message)s ]', '%m/%d/%Y %I:%M:%S %p')
-    file = logging.FileHandler(args.logfile)
-    file.setFormatter(fmt)
-    logger.addHandler(file)
-    print("writing output in {}".format(args.logfile))
+    if args.verbose:
+        console = logging.StreamHandler()
+        console.setFormatter(fmt)
+        logger.addHandler(console)
+    else:
+        file = logging.FileHandler(args.logfile)
+        file.setFormatter(fmt)
+        logger.addHandler(file)
+        print("writing output in {}".format(args.logfile))
     logger.info('COMMAND: %s' % ' '.join(sys.argv))
 
     # Retriever
@@ -45,9 +56,23 @@ def init():
     if args.rerank:
         logger.info('initializing re-ranker...')
         re_ranker = reranker.RerankQaProx(args)
+        if args.print_parameters:
+            from BioAsq6B.qa_proximity import utils
+            model_summary = utils.torch_summarize(re_ranker.predictor.model)
+            logger.info(model_summary)
+        # check if the model needs to load idf data
+        if re_ranker.predictor.model.args.use_idf:
+            idf_file = os.path.join(DATA_DIR, 'qa_prox/idf.p')
+            try:
+                idf = pickle.load(open(idf_file, 'rb'))
+            except:
+                logger.error('Failed to read idf file from {}'.format(idf_file))
+                raise
+            logger.info('Using idf feature: {} loaded'.format(len(idf)))
+            re_ranker.predictor.idf = idf
 
 
-def _write_result(res, stats=None):
+def write_result(res, stats=None):
     """Write the results with performance measures"""
     # Set tabular format for eval results
     table = prettytable.PrettyTable(['Question', 'GT', 'Returned', 'Scores'])
@@ -77,12 +102,10 @@ def _write_result(res, stats=None):
     report = ('precision: {:.4f}, recall: {:.4f}, F1: {:.4f}, '
               'avg_precision: {:.4f}').format(prec, recall, f1, ap)
     # Write out
-    with open(args.logfile, 'a') as f:
-        f.write(table.get_string() + '\n')
-        f.write(report + '\n')
-        print('[#{}, {}/{}]'.format(res['question'][0], res['seq'][0],
-                                    res['seq'][1]), report)
-
+    if args.verbose:
+        logger.info("Details:\n" + table.get_string() + '\n')
+    logger.info('[#{}, {}/{}] {}'.format(res['question'][0], res['seq'][0],
+                                         res['seq'][1], report))
     # Update statistics
     if stats:
         stats['avg_prec'].update(prec)
@@ -166,8 +189,9 @@ def run_by_qlist():
         'logp': AverageMeter()
     }
 
+    logger.info('running over {} questions'.format(len(data['questions'])))
     # Callback function to write the results of queries
-    cb_write_results = partial(_write_result, stats=stats)
+    cb_write_results = partial(write_result, stats=stats)
     # Generate Pool for multiprocessing
     p = Pool(10)
     cnt = 0
@@ -188,9 +212,7 @@ def run_by_qlist():
               ).format(args.run_id, run_time.time(), stats['avg_prec'].avg,
                        stats['avg_recall'].avg, stats['avg_f1'].avg,
                        stats['map'].avg, gmap)
-    with open(args.logfile, 'a') as f:
-        f.write(report)
-    print(report)
+    logger.info(report)
 
 
 def _query(q, seq=None):
@@ -211,7 +233,6 @@ def _query(q, seq=None):
         results['scores'] = OrderedDict(sorted(_scores.items(),
                                                key=lambda t: t[1]['score'],
                                                reverse=True))
-
     # Read expected documents
     results['d_exp'] = []
     for line in q['documents']:
@@ -279,7 +300,8 @@ if __name__ == '__main__':
     # Set Options
     # --------------------------------------------------------------------------
     parser = argparse.ArgumentParser()
-    parser.add_argument('-y', '--year', type=int, default=6, choices=[1,2,3,4,5,6],
+    parser.add_argument('-y', '--year', type=int, default=6,
+                        choices=[1,2,3,4,5,6],
                         help='The year of the data to test on')
     parser.add_argument('--query-model', type=str, default='sdm',
                         help='document retrieval model')
@@ -290,12 +312,16 @@ if __name__ == '__main__':
     parser.add_argument('--ndocs', type=int, default=10,
                         help='Number of document to retrieve')
     parser.add_argument('--score-weights', type=str, default=None,
-                        help='Weights of scoring function;'
-                             '[alpha,beta,gamma,lambda,mu]')
+                        help='comma separated weights of scoring functions')
+    parser.add_argument('--score-fusion', type=str, default='weighted_sum',
+                        choices=['weighted_sum', 'rrf'],
+                        help='Score fusion method')
     parser.add_argument('-l', '--logfile', type=str, default=None,
                         help='Filename to which retrieval results are saved')
     parser.add_argument('-v', '--verbose', action='store_true',
                         help='verbose mode')
+    parser.add_argument('--print-parameters', action='store_true',
+                         help='Print out model parameters')
     args = parser.parse_args()
 
     # set defaults

@@ -14,8 +14,9 @@ logger = logging.getLogger(__name__)
 
 class EncoderBRNN(nn.Module):
     """Bi-directional RNNs"""
-    def __init__(self, input_size, hidden_size, num_layers, dropout_rate=0,
-                 dropout_output=False, concat_layers=False, padding=False):
+    def __init__(self, input_size, hidden_size, num_layers, rnn_type,
+                 dropout_rate=0, dropout_output=False, concat_layers=False,
+                 padding=False, bidirection=True):
         super(EncoderBRNN, self).__init__()
         self.padding = padding
         self.dropout_output = dropout_output
@@ -23,11 +24,16 @@ class EncoderBRNN(nn.Module):
         self.num_layers = num_layers
         self.concat_layers = concat_layers
         self.rnns = nn.ModuleList()
-        for i in range(num_layers):
+        for i in range(num_layers):  # stacked rnn when num_layers 2+
             input_size = input_size if i == 0 else 2 * hidden_size
-            self.rnns.append(nn.GRU(input_size, hidden_size,
-                                    num_layers=self.num_layers,
-                                    bidirectional=True))
+            if rnn_type == 'gru':
+                self.rnns.append(nn.GRU(input_size, hidden_size,
+                                        num_layers=self.num_layers,
+                                        bidirectional=bidirection))
+            elif rnn_type == 'lstm':
+                self.rnns.append(nn.LSTM(input_size, hidden_size,
+                                        num_layers=self.num_layers,
+                                        bidirectional=bidirection))
 
     def forward(self, x, x_mask):
         """Encode either padded or non-padded sequences.
@@ -161,7 +167,6 @@ class BilinearSeqAttn(nn.Module):
     def __init__(self, x_size, y_size):
         super(BilinearSeqAttn, self).__init__()
         self.linear = nn.Linear(y_size, x_size)
-        self.decoder = nn.Linear(1, 2)  # binary classes
 
     def forward(self, x, y, x_mask):
         """
@@ -170,14 +175,31 @@ class BilinearSeqAttn(nn.Module):
             y: batch * hdim2
             x_mask: batch * len (1 for padding, 0 for true)
         Output:
-            alpha = batch * len
+            alpha = max(batch * len)
         """
         Wy = self.linear(y)
         xWy = x.bmm(Wy.unsqueeze(2)).squeeze(2)
         xWy.data.masked_fill_(x_mask.data, -float('inf'))
-        alpha = self.decoder(xWy.max(1, keepdim=True)[0])
+        p = xWy.max(1)[0]
+        return p
 
-        return alpha
+class NTN(nn.Module):
+    """Neural Tensor Network (http://stanford.io/2nTUcLt)"""
+    def __init__(self, e1_size, e2_size):
+        super(NTN, self).__init__()
+        self.bilinear_dim = 3
+
+        pass
+
+    def forward(self, x, y, x_mask):
+        """
+        Args:
+            x: batch * len * hdim1
+            y: batch * hdim2
+            x_mask: batch * len (1 for padding, 0 for true)
+        """
+        We2 = self.linear(y)
+        e1We2 = x.bmm(We2.unsqueeze(2)).squeeze(2)
 
 
 # ------------------------------------------------------------------------------
@@ -221,7 +243,7 @@ class QaProxBiRNN(nn.Module):
     def __init__(self, args):
         super(QaProxBiRNN, self).__init__()
         self.args = args
-        self.num_rnn_layers = 1
+        self.num_rnn_layers = args.num_rnn_layers
 
         # Define layers
         #-----------------------------------------------------------------------
@@ -231,23 +253,37 @@ class QaProxBiRNN(nn.Module):
                                     padding_idx=0)
         # Context
         c_input_size = args.embedding_dim + args.num_features
+        if args.use_idf:
+            c_input_size += 1
         # print(c_input_size, args.embedding_dim, args.num_features)
         self.c_rnn = EncoderBRNN(
+            rnn_type=args.rnn_type,
             input_size=c_input_size,
             hidden_size=args.hidden_size,
-            num_layers=self.num_rnn_layers)
+            concat_layers=args.concat_rnn_layers,
+            num_layers=self.num_rnn_layers,
+            bidirection=(not args.uni_direction)
+        )
         # Question
         self.q_rnn = EncoderBRNN(
+            rnn_type=args.rnn_type,
             input_size=c_input_size,
             hidden_size=args.hidden_size,
-            num_layers=self.num_rnn_layers)
+            concat_layers=args.concat_rnn_layers,
+            num_layers=self.num_rnn_layers,
+            bidirection=(not args.uni_direction)
+        )
 
-        c_hidden_size = 2 * args.hidden_size
-        q_hidden_size = 2 * args.hidden_size
+        c_hidden_size = args.hidden_size \
+            if args.uni_direction else 2 * args.hidden_size
+        q_hidden_size = args.hidden_size \
+            if args.uni_direction else 2 * args.hidden_size
+
         if args.concat_rnn_layers:
             c_hidden_size *= self.num_rnn_layers
             q_hidden_size *= self.num_rnn_layers
         # Bilinear attention
+        self.rel_attn = NTN(c_hidden_size, q_hidden_size)
         self.rel_attn = BilinearSeqAttn(c_hidden_size, q_hidden_size)
         # self.rel_attn = nn.Bilinear(c_hidden_size, q_hidden_size, 2)
 
@@ -259,6 +295,8 @@ class QaProxBiRNN(nn.Module):
         x2 = question word indices             [batch * len_q]
         x2_f = question word features indices  [batch * len_q * nfeat]
         x2_mask = question padding mask        [batch * len_q]
+
+        Note. mask is not being used in with any of RNNs
         """
         # Embed both context and question
         x1_emb = self.encoder(x1)
@@ -272,15 +310,16 @@ class QaProxBiRNN(nn.Module):
                                            training=self.training)
 
         # Encode (context + features) with RNN
-        try:
+        if self.args.no_token_feature:
+            c_hiddens = self.c_rnn(x1_emb, x1_mask)
+        else:
             c_hiddens = self.c_rnn(torch.cat([x1_emb, x1_f], 2), x1_mask)
-        except RuntimeError:
-            logger.error(x1_emb.size())
-            logger.error(x1_f.size())
-            logger.error(x1_mask.size())
 
         # Encode (question + features) with RNN
-        q_hiddens = self.q_rnn(torch.cat([x2_emb, x2_f], 2), x2_mask)
+        if self.args.no_token_feature:
+            q_hiddens = self.q_rnn(x2_emb, x2_mask)
+        else:
+            q_hiddens = self.q_rnn(torch.cat([x2_emb, x2_f], 2), x2_mask)
 
         # Merge question hiddens
         q_merge_weights = uniform_weights(q_hiddens, x2_mask)

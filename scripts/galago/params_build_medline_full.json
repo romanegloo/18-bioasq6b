@@ -1,21 +1,32 @@
 {
-  "fileType" : "trectext",
-  "server" : true,
-  "port" : 45678,
-  "inputPath" : "/home/jno236/data/medline17_trec1",
-  "indexPath" : "/home/jno236/data/galago-medline-full-jan15.idx",
   "corpus" : true,
-  "fieldIndex" : true,
-  "galagoJobDir" : "/home/jno236/research/18-bioasq/data/galago-jan15.job",
-  "galagoTmpDir" : "/home/jno236/research/18-bioasq/data/galago-jan15.tmp",
   "deleteJobDir" : true,
+  "distrib": 70,
+  "fieldIndex" : true,
+  "fieldIndexParameters" : {
+    "nonStemmedPostings" : true,
+    "stemmedPostings" : true,
+    "stemmer" : [ "krovetz" ]
+  },
+  "fileType" : "trectext",
+  "galagoJobDir" : "/home/jno236/research/18-bioasq/data/galago-Mar5.job",
+  "galagoTmpDir" : "/home/jno236/research/18-bioasq/data/galago-Mar5.tmp",
+  "indexPath" : "/home/jno236/data/galago-pubmed18-full-Mar5.idx",
+  "inputPath" : "/home/jno236/data/pubmed18_trectext",
+  "mem" : "64g",
+  "nativeSpec" : "-l mem_free=64G -l h_vmem=64G",
+  "nonStemmedPostings" : true,
+  "port" : 45678,
+  "server" : true,
+  "stemmedPostings" : true,
+  "stemmer" : [ "krovetz" ],
+  "stemmerClass" : {
+    "krovetz" : "org.lemurproject.galago.core.parse.stem.KrovetzStemmer"
+  },
   "tokenizer" : {
     "class" : "org.lemurproject.galago.core.parse.TagTokenizer",
     "fields" : ["docno", "title", "journal_title", "medline_ta",
       "chemical_ui", "chemical", "mesh_ui", "mesh_desc", "mesh_qual", "keywords"]
   },
-  "mode": "drmaa",
-  "distrib": 70,
-  "mem" : "16g",
-  "nativeSpec" : "-l mem_free=16G -l h_vmem=16G"
+  "mode": "drmaa"
 }

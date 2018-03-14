@@ -6,7 +6,7 @@ import code
 import argparse
 import logging
 
-from BioAsq6B import DATA_DIR
+from BioAsq6B import PATHS
 from BioAsq6B.qa_proximity import Predictor
 
 logger = logging.getLogger()
@@ -22,7 +22,7 @@ parser.add_argument('--qaprox-model', type=str,
 args = parser.parse_args()
 
 if args.model is None:
-    args.model = os.path.join(DATA_DIR, 'qa_prox/var/best.mdl')
+    args.model = PATHS['qasim_model']
 
 p = Predictor(args)
 
