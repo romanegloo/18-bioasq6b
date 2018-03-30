@@ -17,83 +17,99 @@ logger = logging.getLogger()
 
 
 class GalagoRanker(object):
-    def __init__(self, args, ngrams=2, cached_retrievals=None):
+    def __init__(self, args, ngrams=2, cached_scores=None):
         self.args = args
         self.index_path = PATHS['galago_idx']
         self.db_path = PATHS['concepts_db']
         self.tokenizer = DEFAULTS['tokenizer']()
         self.ngrams = ngrams
-        self.cached_retrievals = cached_retrievals
-
-    def batch_closest_docs(self, queries, k=10):
-        """parse batch queries, run doc ranker, and return the list of ranked
-        documents in trec-eval format"""
-        if self.args.query_model == 'sdm':
-            q_obj = self.query_sdm(queries, k)
-        elif self.args.query_model == 'rm':
-            q_obj = self.query_rm(queries, k)
-        else:
-            q_obj = self.query_baseline(queries, k)
-
-        # save temporary query_file for galago use
-        (_, fp) = tempfile.mkstemp()
-        with open(fp, 'w') as out_f:
-            json.dump(q_obj, fp=out_f, indent=4, separators=(',', ': '))
-
-        # run galago
-        try:
-            p = subprocess.run(['galago', 'batch-search', fp],
-                               stdout=subprocess.PIPE)
-        finally:
-            logger.debug('removing tmp file: {}'.format(fp))
-            if os.path.exists(fp):
-                os.remove(fp)
-
-        if self.args.verbose:
-            print(p.stdout.decode('utf-8'))
-        return self._batch_extract_id_scores(p.stdout.decode('utf-8'))
+        self.cached_scores = cached_scores
 
     def closest_docs(self, query, k=10):
         """Closest docs for one query"""
-        # Check if cached retrieval results are being used.
-        if self.cached_retrievals:
-            key = query['id'] + '-' + str(k)
-            if key in self.cached_retrievals:
-                return self.cached_retrievals[key]
-        if self.args.query_model == 'sdm':
-            q_obj = self.query_sdm([query], k)
-        elif self.args.query_model == 'rm':
-            q_obj = self.query_rm([query], k)
-        else:
-            q_obj = self.query_baseline([query], k)
-
+        # Read from cached scores, if use_cache_scores is true
+        if self.args.use_cache_scores in [2, 4]:
+            key = query['id'] + '-ret'
+            # Make sure that enough number of results exist
+            if key in self.cached_scores:
+                docids_, scores_ = self.cached_scores[key]
+                if len(docids_) >= k and len(docids_) == len(scores_):
+                    return self.cached_scores[key]
         # save temporary query_file for galago use
-        (_, fp) = tempfile.mkstemp()
-        with open(fp, 'w') as out_f:
-            json.dump(q_obj, fp=out_f, indent=4, separators=(',', ': '))
-
-        # run galago
-        trial = 3
-        while trial > 0:
+        if self.args.query_model == 'sdm':
+            # Run two pass; one with stemmer and two without stemmer
+            g_verbose = (self.args.qid is not None)
+            q_tmpl = {
+                'verbose': g_verbose,
+                'casefold': False,
+                'requested': k,
+                'defaultTextPart': 'postings',
+                'index': self.index_path,
+                'queries': []
+            }
+            q_obj = self.query_sdm([query], q_tmpl=q_tmpl)
+            (_, fp) = tempfile.mkstemp()
+            json.dump(q_obj, fp=open(fp, 'w'), indent=4, separators=(',', ': '))
             p = subprocess.run(['galago', 'batch-search', fp],
                                stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
-            if p.returncode != 0:
-                logger.error("galago execution failed {}/3".format(4-trial))
-                logger.warning(q_obj)
-                trial -= 1
+            if self.args.qid is not None:
+                logger.info(p.stdout.decode('utf-8'))
+            docids_scores1 = self._extract_id_scores(p.stdout.decode('utf-8'))
+            # Run second pass
+            p = None
+            q_tmpl['defaultTextPart'] = 'postings.krovetz'
+            q_tmpl['queries'] = []
+            q_obj = self.query_sdm([query], q_tmpl=q_tmpl)
+            (_, fp) = tempfile.mkstemp()
+            json.dump(q_obj, fp=open(fp, 'w'), indent=4, separators=(',', ': '))
+            p = subprocess.run(['galago', 'batch-search', fp],
+                               stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
+            if self.args.qid is not None:
+                logger.info(p.stdout.decode('utf-8'))
+            docids_scores2 = self._extract_id_scores(p.stdout.decode('utf-8'))
+            docids_scores = \
+                self.merge_retrieval_scores(docids_scores1, docids_scores2, k=k)
+        elif self.args.query_model == 'rm':
+            """not fully implemented"""
+            q_obj = self.query_rm([query], k)
+        else:
+            """not fully implemented"""
+            q_obj = self.query_baseline([query], k)
+
+        if self.args.use_cache_scores in [1, 3]:
+            key = query['id'] + '-ret'
+            self.cached_scores[key] = docids_scores
+        return docids_scores
+
+    def merge_retrieval_scores(self, l1, l2, k=10):
+        """merge two lists of scores; l1 (non-stemmer results), l2 (stemmer)"""
+        scores = dict()
+        for i, docid in enumerate(l1[0]):
+            if docid not in scores:
+                scores[docid] = [l1[1][i], -9999]
             else:
-                trial = 0
+                scores[docid][0] = l1[1][i]
+        for i, docid in enumerate(l2[0]):
+            if docid not in scores:
+                scores[docid] = [-9999, l2[1][i]]
+            else:
+                scores[docid][1] = l2[1][i]
+        docids = []
+        merged_scores = []
+        for id, v in scores.items():
+            docids.append(id)
+            merged_scores.append(max(v))
+            # if v[0] == 0:
+            #     merged_scores.append(v[1])
+            # elif v[1] == 0:
+            #     merged_scores.append(v[0])
+            # else:
+            #     merged_scores.append((v[0] + v[1]) / 2)
+        merged_sorted = sorted(zip(docids, merged_scores),
+                               key=lambda p: p[1], reverse=True)
 
-        if os.path.exists(fp):
-            os.remove(fp)
-
-        if self.args.verbose:
-            print(p.stdout.decode('utf-8'))
-        scores = self._extract_id_scores(p.stdout.decode('utf-8'))
-        if self.args.cache_retrieval:
-            key = query['id'] + '-' + str(k)
-            self.cached_retrievals[key] = scores
-        return scores
+        return [x[0] for x in merged_sorted][:k], \
+               [x[1] for x in merged_sorted][:k]
 
     def sanitize(self, tokens, type):
         if type == 'band':
@@ -128,16 +144,7 @@ class GalagoRanker(object):
 
         return tokens
 
-    def query_sdm(self, queries, k=1):
-        g_verbose = (self.args.qid is not None)
-        q_tmpl = {
-            'verbose': g_verbose,
-            'casefold': True,
-            'requested': k,
-            'defaultTextPart': 'postings.krovetz',
-            'index': self.index_path,
-            'queries': []
-        }
+    def query_sdm(self, queries, q_tmpl=None):
         for i, q in enumerate(queries):
             query = {'number': q['id']}
             tokens = self.tokenizer.tokenize(q['body'])
@@ -178,7 +185,7 @@ class GalagoRanker(object):
             # query['text'] = q_
             # query['text'] = "#combine({} {})".format(band_, sdm_)
             query['text'] = sdm_
-            query['sdm.od.width'] = 3
+            query['sdm.od.width'] = 2
             q_tmpl['queries'].append(query)
         return q_tmpl
 

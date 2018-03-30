@@ -14,7 +14,7 @@ import torch
 from torch.utils.data import DataLoader, sampler
 
 from BioAsq6B import common
-from BioAsq6B.qa_proximity import utils, QaProx
+from BioAsq6B.qa_proximity import utils, QaSimSpan
 
 logger = logging.getLogger()
 
@@ -329,7 +329,7 @@ if __name__ == '__main__':
     # Arguments
     # --------------------------------------------------------------------------
     parser = argparse.ArgumentParser(
-        'package_name',
+        'The BioAsq 6B QA_Sim Model',
         formatter_class=argparse.ArgumentDefaultsHelpFormatter
     )
     add_arguments(parser)
@@ -368,7 +368,7 @@ if __name__ == '__main__':
         # ----------------------------------------------------------------------
         # Model setup
         # ----------------------------------------------------------------------
-        model = QaProx(args, word_dict, feature_dict)
+        model = QaSimSpan(args, word_dict, feature_dict)
         model_summary = utils.torch_summarize(model)
         if args.print_parameters:
             logger.info(model_summary)

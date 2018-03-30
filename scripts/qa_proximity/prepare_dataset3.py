@@ -1,7 +1,7 @@
-"""A variant preprocessing script from prepare_dataset2.py. This script write
-the training dataset for a NN model that predicts the answer span (text
-snippets), instead of classifying sentences in similarity to the question.
-The fields of each question-answer_span includes [lemma, question, ner, pos,
+"""A variant preprocessing script from prepare_dataset2.py. This script writes
+the datasets for QA_sim model that predicts the answer span (text
+snippets), instead of classifying sentences in the similarity to the question.
+The fields of each question-answer span includes [lemma, question, ner, pos,
 offsets, answers, document, qlemma, qid, idf, qtype]."""
 
 import os
@@ -22,9 +22,8 @@ from multiprocessing import Pool
 def parse_qa_snippets(qa):
     """Reads qa pairs, generate examples from the text snippets"""
     doc_record = dict()
-    ordered_keys = ['qid', 'qtype', 'question', 'docid', 'qlemma', 'title',
-                    'abstract', 'lemma', 'ner', 'pos', 'offsets', 'idf',
-                    'answers']
+    ordered_keys = ['qid', 'qtype', 'question', 'docid', 'qlemma', 'context',
+                    'lemma', 'ner', 'pos', 'offsets', 'idf', 'answers']
     sections = ['abstract', 'title', 'sections.0']
     q_ = nlp(qa['body'])
     for s in qa['snippets']:
@@ -46,28 +45,30 @@ def parse_qa_snippets(qa):
             rec['qid'] = qa['id']
             rec['qtype'] = qa['type']
             # Find the title and abstract
+            context = {}
             for f in ['TEXT', 'TITLE']:
                 len_ = len(f) + 2
                 start = doc.find('<{}>'.format(f)) + len_
                 end = doc.find('</{}>'.format(f))
                 key = 'abstract' if f == 'TEXT' else 'title'
-                rec[key] = ''
                 if not (end <= start <= len_ and end <= 0):
-                    rec[key] = doc[start:end]
+                    context[key] = doc[start:end]
             # Some titles are enclosed in brackets
-            rec['title'] = re.sub(r'[\[\]]', '', rec['title'])
+            context['title'] = re.sub(r'[\[\]]', '', context['title'])
             # Parse title and abstract
-            title_ = nlp(rec['title'])
-            abstract_ = nlp(rec['abstract'])
-            for k in ['lemma', 'ner', 'pos', 'offsets', 'idf']:
+            title_ = nlp(context['title'])
+            abstract_ = nlp(context['abstract'])
+            for k in ['context', 'lemma', 'ner', 'pos', 'offsets', 'idf']:
                 rec[k] = [[]] * 2
             for i, text in enumerate([title_, abstract_]):
+                rec['context'][i] = [t.text.lower() for t in text]
                 rec['lemma'][i] = [t.lemma_ for t in text]
                 rec['ner'][i] = [t.ent_type_ for t in text]
                 rec['pos'][i] = [t.pos_ for t in text]
                 rec['idf'][i] = [idf[t.text.lower()] if t.text.lower() in idf
                                  else 0 for t in text]
                 offset_start = 0
+                rec['offsets'][i] = []
                 for token in text:
                     rec['offsets'][i].append((offset_start, len(token)))
                     offset_start += len(token) + 1
@@ -76,26 +77,48 @@ def parse_qa_snippets(qa):
         doc_record[docid]['answers'].append((s['beginSection'],
                                              s['offsetInBeginSection'],
                                              s['offsetInEndSection']))
+    # Convert answer offsets into tokens
+    logger.info('1')
+    for k, doc in doc_record.items():
+        logger.info('2')
+        answers = []
+        for span in doc['answers']:
+            logger.info('3')
+            begin_ = 0
+            end_ = 0
+            section = 0 if span[0] == 'title' else 1
+            idx_cont = 0
+            for i, t in enumerate(doc['offsets'][section]):
+                logger.info('4')
+                if t[0] <= span[1] <= sum(t):
+                    begin_ = i
+                    idx_cont = i
+                    break
+            for i, t in enumerate(doc['offsets'][section][idx_cont+1:]):
+                logger.info('5')
+                if t[0] <= span[2] <= sum(t):
+                    end_ = i + idx_cont + 1
+                    break
+            logger.info('6')
+            answers.append((span[0], begin_, end_))
+        logger.info('7')
+        doc['answers'] = answers
+
     return doc_record, qa['id']
 
 
 def parse_qa(qa, docnum_max):
     """Reads qa pairs, random sample documents from the entire pool,
     and generate negative examples"""
-    logger.info('1')
     doc_record = dict()
-    ordered_keys = ['qid', 'qtype', 'question', 'docid', 'qlemma', 'title',
-                    'abstract', 'lemma', 'ner', 'pos', 'offsets', 'idf',
-                    'answers']
+    ordered_keys = ['qid', 'qtype', 'question', 'docid', 'qlemma', 'context',
+                    'lemma', 'ner', 'pos', 'offsets', 'idf', 'answers']
     q_ = nlp(qa['body'])
-    logger.info('2')
     # Count documents that has text snippets, and sample 1/2 of the size
     # random documents
     numdocs = int(len(set([s['document'] for s in qa['snippets']])) / 2 + .5)
     sample = [random.randint(1, docnum_max) for _ in range(numdocs)]
-    logger.info('3')
     for docid in sample:
-        logger.info('4')
         rec = OrderedDict.fromkeys(ordered_keys)
         # Get PMID from document sequence number
         p = subprocess.run(['galago', 'doc-name', (idx_dir/'names').as_posix(),
@@ -106,32 +129,29 @@ def parse_qa(qa, docnum_max):
                             '--index={}'.format(idx_dir.as_posix()),
                             '--id={}'.format(pmid)], stdout=subprocess.PIPE)
         doc = p.stdout.decode('utf-8')
-        logger.info('5')
         rec['docid'] = pmid
         rec['question'] = [t.text.lower() for t in q_]
         rec['qlemma'] = [t.lemma_ for t in q_]
         rec['qid'] = qa['id']
         rec['qtype'] = qa['type']
         # Find the title and abstract
+        context = {}
         for f in ['TEXT', 'TITLE']:
-            logger.info('6')
             len_ = len(f) + 2
             start = doc.find('<{}>'.format(f)) + len_
             end = doc.find('</{}>'.format(f))
             key = 'abstract' if f == 'TEXT' else 'title'
-            rec[key] = ''
             if not (end <= start <= len_ and end <= 0):
-                rec[key] = doc[start:end]
+                context[key] = doc[start:end]
             # Some titles are enclosed in brackets
-        logger.info('7')
-        rec['title'] = re.sub(r'[\[\]]', '', rec['title'])
+        context['title'] = re.sub(r'[\[\]]', '', context['title'])
         # Parse title and abstract
-        title_ = nlp(rec['title'])
-        abstract_ = nlp(rec['abstract'])
-        for k in ['lemma', 'ner', 'pos', 'offsets', 'idf']:
+        title_ = nlp(context['title'])
+        abstract_ = nlp(context['abstract'])
+        for k in ['context', 'lemma', 'ner', 'pos', 'offsets', 'idf']:
             rec[k] = [[]] * 2
-        logger.info('8')
         for i, text in enumerate([title_, abstract_]):
+            rec['context'][i] = [t.text.lower() for t in text]
             rec['lemma'][i] = [t.lemma_ for t in text]
             rec['ner'][i] = [t.ent_type_ for t in text]
             rec['pos'][i] = [t.pos_ for t in text]
@@ -142,7 +162,6 @@ def parse_qa(qa, docnum_max):
                 rec['offsets'][i].append((offset_start, len(token)))
                 offset_start += len(token) + 1
         rec['answers'] = []
-        logger.info('9')
         doc_record[docid] = rec
     return doc_record, qa['id']
 
@@ -156,7 +175,7 @@ def write_examples(rst):
 
 def build_dataset(data, dev_pairs):
     # Select pairs in mode
-    if mode == 'train':
+    if mode == 'dev':
         pairs = [q for q in data['questions'] if q['id'] in dev_pairs]
     else:
         pairs = [q for q in data['questions'] if q['id'] not in dev_pairs]
@@ -169,14 +188,15 @@ def build_dataset(data, dev_pairs):
     p.close()
     p.join()
 
-    print("Adding neg examples into {} dataset ({} pairs)..."
-          ''.format(mode, len(pairs)))
+    # below is commented out: no way to train with unlabelled documents
+    # print("Adding neg examples into {} dataset ({} pairs)..."
+    #       ''.format(mode, len(pairs)))
     # Add negative examples (from irrelevant documents)
-    p = Pool()
-    for qa in pairs:
-        p.apply_async(parse_qa, args=(qa, docnum_max), callback=write_examples)
-    p.close()
-    p.join()
+    # p = Pool()
+    # for qa in pairs:
+    #     p.apply_async(parse_qa, args=(qa, docnum_max), callback=write_examples)
+    # p.close()
+    # p.join()
 
 
 # ------------------------------------------------------------------------------

@@ -30,14 +30,13 @@ from BioAsq6B.data_services import ConceptRetriever
 def init():
     """Set default values and initialize components"""
     global doc_ranker, re_ranker
+    doc_ranker = re_ranker = None
 
     # --------------------------------------------------------------------------
     # Set default options
     # --------------------------------------------------------------------------
     if args.run_id is None:
         args.run_id = datetime.today().strftime("%b%d-%H%M")
-    else:
-        args.run_id = datetime.today().strftime("%b%d-%H%M-") + args.run_id
     PATHS['log_file'] = os.path.join(PATHS['runs_dir'], args.run_id + '.log')
     if args.qid:
         if args.mode == 'train':
@@ -45,9 +44,6 @@ def init():
                            "QA pair")
             args.mode = 'test'
         args.year = 6  # By so, force to read all pairs as testing dataset
-    if args.cache_scores:
-        score_datafile = 'qa_prox/var/qa_scores-{}.pkl'.format(args.run_id)
-        args.score_datafile = os.path.join(PATHS['data_dir'], score_datafile)
 
     # --------------------------------------------------------------------------
     # Configure a logger
@@ -123,46 +119,50 @@ def init():
     # --------------------------------------------------------------------------
     # Initialize components
     # --------------------------------------------------------------------------
+    # Cached Scores
+    args.use_cache_scores = 3
+    cached_scores = dict()
+    if os.path.exists(PATHS['cached_scores_file']):
+        ans = 0
+        while int(ans) not in [1, 2, 3, 4]:
+            ans = input("Cached scores found. Choose an option: \n"
+                        "  1. update retrieval scores\n"
+                        "  2. update reranker scores\n"
+                        "  3. update both\n"
+                        "  4. do not update (use cached scores)\n"
+                        "[1-4]? ")
+        args.use_cache_scores = int(ans)
+        logger.info('Reading cached scores...')
+        try:
+            cached_scores = \
+            pickle.load(open(PATHS['cached_scores_file'], 'rb'))
+        except:
+            logger.warning('Failed to read cached scores file {}'
+                           ''.format(PATHS['cached_scores_file']))
+            args.use_cache_scores = 3
+            cached_scores = dict()
+
     # Doc-ranker
     logger.info('initializing retriever...')
-    if args.mode == 'train' and args.cache_retrieval:
-        logger.info('cache_retrieval created')
-        manager = Manager()
-        cached_retrievals = manager.dict()
-        doc_ranker = \
-            retriever.get_class('galago')(args,
-                                          cached_retrievals=cached_retrievals)
+    if args.use_cache_scores in [2, 4]:
+        cached_scores_dist = Manager().dict(cached_scores)
     else:
-        doc_ranker = retriever.get_class('galago')(args)
+        cached_scores_dist = Manager().dict()
+
+    doc_ranker = retriever.get_class('galago')(args,
+                                               cached_scores=cached_scores_dist)
+
     # Re-ranker
     if args.rerank:
         logger.info('initializing re-ranker...')
-        # If using the cached QA_sim scores for faster evaluation
-        cached_scores = None
-        if args.cache_scores:
-            manager = Manager()
-            if os.path.isfile(args.score_datafile):
-                # Confirm if a user wants to read the cached scores, or start
-                # from the scratch
-                ans = input("Cached proximity scores exist. Do you want to read"
-                            " [Y/n]? ")
-                if ans.lower().startswith('n'):
-                    cached_scores = manager.dict()
-                else:
-                    print('Reading the scores: {}'.format(args.score_datafile))
-                    with open(args.score_datafile, 'rb') as f:
-                        scores = pickle.load(f)
-                    cached_scores = manager.dict(scores)
-            else:
-                cached_scores = manager.dict()
-
-        re_ranker = reranker.RerankQaProx(args, cached_scores=cached_scores)
+        re_ranker = reranker.RerankQaProx(args,
+                                          cached_scores=cached_scores_dist)
         if args.print_parameters:
             from BioAsq6B.qa_proximity import utils
             model_summary = utils.torch_summarize(re_ranker.predictor.model)
             logger.info(model_summary)
         # Check if the model needs to load idf data
-        if re_ranker.predictor.model.args.use_idf:
+        if 'idf' in re_ranker.predictor.model.conf['features']:
             try:
                 idf = pickle.load(open(PATHS['idf_file'], 'rb'))
             except:
@@ -175,9 +175,6 @@ def init():
 
 def add_arguments(parser):
     """Define parameters with user provided arguments"""
-    def str2bool(v):
-        return v.lower() in ('yes', 'true', 't', '1', 'y')
-
     # Runtime Settings
     runtime = parser.add_argument_group('Runtime Settings')
     runtime.add_argument('--mode', type=str, default='train',
@@ -205,6 +202,8 @@ def add_arguments(parser):
     runtime.add_argument('--update-concepts', action='store_true',
                          help='Get concepts from data services, and update '
                               'the existing concepts database')
+    runtime.add_argument('--num-workers', type=int, default=40,
+                         help='Number of workers in a multiprocessing pool')
     runtime.add_argument('--debug', action='store_true')
     # Retriever Settings
     retriever = parser.add_argument_group('Retriever Settings')
@@ -212,21 +211,22 @@ def add_arguments(parser):
                            help='The weights used in galago query statements')
     retriever.add_argument('--ndocs', type=int, default=10,
                            help='Number of document to retrieve')
-    retriever.add_argument('-r', '--cache-retrieval', action='store_true',
-                           help='Enable caching galago retrieval results')
-    retriever.add_argument('-c', '--cache-scores', action='store_true',
-                           help='Enable caching of the qa_sim scores')
+    retriever.add_argument('-c', '--use-cache-scores', action='store_true',
+                           help='Use cached retrieval and QaSim scores over '
+                                'qids')
     # Reranker settings
     reranker = parser.add_argument_group('Reranker Settings')
     reranker.add_argument('--rerank', action='store_true',
-                           help='Enable re-ranker using qa_proximity model')
+                          help='Enable re-ranker using qa_proximity model')
     reranker.add_argument('--score-weights', type=str, default=None,
-                           help='comma separated weights of scoring functions')
+                          help='comma separated weights of scoring functions')
     reranker.add_argument('--score-fusion', type=str, default='weighted_sum',
-                           choices=['weighted_sum', 'rrf'],
-                           help='Score fusion method')
+                          choices=['weighted_sum', 'rrf'],
+                          help='Score fusion method')
     reranker.add_argument('--query-model', type=str, default='sdm',
-                           help='document retrieval model')
+                          help='document retrieval model')
+    reranker.add_argument('--word-dict-file', type=str, default='word_dict.pkl',
+                          help='Path to word_dict file for test/dry run')
     # Model Architecture: model specific options
     model = parser.add_argument_group('Model Architecture')
     model.add_argument('--qasim-model', type=str,
@@ -252,10 +252,15 @@ def write_result_articles(res, stats=None):
         k = colored(k, 'blue') if k in res['d_exp'] else k
         col2.append('{:>8}'.format(k))
         if 'rel_scores' in v:
-            col3.append('({:.2f}, ({:.2f}/{:.2f}/{:.2f}), {:.4E})'
-                        ''.format(v['ret_score'], v['rel_scores'][0],
-                                  v['rel_scores'][1], v['rel_scores'][2],
-                                  v['score']))
+            if type(v['rel_scores']) == tuple:
+                col3.append('({:.2f}, ({:.2f}/{:.2f}/{:.2f}), {:.4E})'
+                            ''.format(v['ret_score'], v['rel_scores'][0],
+                                      v['rel_scores'][1], v['rel_scores'][2],
+                                      v['score']))
+            else:
+                col3.append('({:.2f}, {:.2f}), {:.2f}'
+                            ''.format(v['ret_score'], v['rel_scores'],
+                                      v['score']))
         else:
             col3.append('({:.4f}, {:.4E})'
                         ''.format(v['ret_score'], v['score']))
@@ -265,7 +270,7 @@ def write_result_articles(res, stats=None):
     prec, recall, f1, ap = \
         measure_performance(res['d_exp'], list(res['scores']), cutoff=10)
     report = ('precision: {:.4f}, recall: {:.4f}, F1: {:.4f}, '
-              'avg_precision: {:.4f}').format(prec, recall, f1, ap)
+              'avg_prec_10: {:.4f}').format(prec, recall, f1, ap)
     # Write out
     if args.verbose:
         logger.info("Details:\n" + table.get_string() + '\n')
@@ -295,10 +300,8 @@ def write_result_articles_dry(res):
     for k, v in res['scores'].items():
         col1.append('{:>8}'.format(k))
         if 'rel_scores' in v:
-            col2.append('({:.2f}, ({:.2f}/{:.2f}/{:.2f}), {:.4E})'
-                        ''.format(v['ret_score'], v['rel_scores'][0],
-                                  v['rel_scores'][1], v['rel_scores'][2],
-                                  v['score']))
+            col2.append('({:.2f}, {:.2f}), {:.4E})'
+                        ''.format(v['ret_score'], v['rel_scores'], v['score']))
         else:
             col2.append('({:.4f}, {:.4E})'
                         ''.format(v['ret_score'], v['score']))
@@ -325,7 +328,7 @@ def query(q, seq=None):
         results['seq'] = (1, 1)
     (docids, ret_scores) = doc_ranker.closest_docs(q, k=args.ndocs)
     if args.rerank:
-        (rel_scores, snippets) = re_ranker.get_prox_scores(docids, q)
+        rel_scores, snippets = re_ranker.get_prox_scores(docids, q)
         results['scores'] = re_ranker.merge_scores(args.score_weights, docids,
                                                    ret_scores, rel_scores)
         results['snippets'] = snippets
@@ -342,6 +345,7 @@ def query(q, seq=None):
             m = re.match(".*pubmed/(\d+)$", line)
             if m:
                 results['d_exp'].append(m.group(1))
+
     return results
 
 
@@ -363,11 +367,9 @@ def test():
             cb_write_results = partial(write_result_articles, stats=stats)
             # Generate pool for multiprocessing
             p = Pool(16)
-            count = 0
-            for q in test_data[b]:
-                p.apply_async(query, args=(q, (count, len(test_data[b]))),
+            for seq, q in enumerate(test_data[b]):
+                p.apply_async(query, args=(q, (seq, len(test_data[b]))),
                               callback=cb_write_results)
-                count += 1
             p.close()
             p.join()
         # Report the overall batch performance measures
@@ -453,11 +455,6 @@ def _run_epoch():
     if args.galago_weights:
         logger.info('current weights: {}'.format(args.galago_weights))
     logger.info(report)
-    # if caching score is enabled, store the scores
-    if args.cache_scores:
-        logger.info("Proximity Scores are saved")
-        pickle.dump(dict(re_ranker.cached_scores),
-                    open(args.score_datafile, 'wb'))
     # Returns (1 - 'map' score) as the cost
     return (1 - stats['map'].avg)
 
@@ -465,9 +462,11 @@ def _run_epoch():
 def train1():
     """Hyperparameter optimization: adaptive random search"""
     """Best Weights: [0.8554,0.1228,0.0210,0.1825]"""
+    """Best Weights: [0.74,0.15]"""
     initial_weights = list(map(float, args.score_weights.split(',')))
-    optimizer = AdaptiveRandomSearch([[0, 1]] * 4, objective_fn,
-                                     initial_weights, max_iter=500)
+    optimizer = AdaptiveRandomSearch([[0, 1]] * len(initial_weights),
+                                     objective_fn, initial_weights,
+                                     max_iter=100)
     best = optimizer.search()
     logger.info("BEST params: {}".format(best))
 
@@ -476,7 +475,8 @@ def train2():
     """Optimize the weights used in galago queries (text, mesh_desc, mesh_ui)"""
     initial_weights = list(map(float, args.galago_weights.split(',')))
     optimizer = AdaptiveRandomSearch([[0, 5]] * 2, objective_fn2,
-                                     initial_weights, max_iter=500)
+                                     initial_weights,
+                                     max_iter=100)
     best = optimizer.search()
     logger.info("BEST params: {}".format(best))
 
@@ -542,8 +542,6 @@ def save_results_dry(questions, concepts, articles, rdfs):
 
             # MeSH
             tmpl_ = "https://meshb.nlm.nih.gov/record/ui?ui={}"
-            # tmpl_ = "https://www.nlm.nih.gov/cgi/mesh/2017/MB_cgi?field=uid" \
-            #         "&exact=Find+Exact+Term&term={}"  # 2017
             entry['concepts'].extend([tmpl_.format(id) for id in MeSH])
             # GO
             tmpl_ = "http://amigo.geneontology.org/cgi-bin/amigo/term_details" \
@@ -562,7 +560,7 @@ def save_results_dry(questions, concepts, articles, rdfs):
             entry['documents'] = [tmpl_.format(s[0]) for s in scores]
         # Text Snippets (that appear in the returned article list)
         snp_appeared = []
-        if 'snippets' in articles[q['id']]:
+        if q['id'] in articles and 'snippets' in articles[q['id']]:
             for s in articles[q['id']]['snippets']:
                 if s[0]['document'] in entry['documents']:
                     snp_appeared.append(s[0])
@@ -585,25 +583,31 @@ def save_results_dry(questions, concepts, articles, rdfs):
     json.dump(output, open(output_file, 'w'), indent=4, separators=(',', ': '))
 
 
+def add_results(res, articles=None):
+    logger.info('=== {} / {} ==='.format(*res['seq']))
+    articles[res['question'][0]] = res
+    write_result_articles_dry(res)
+    return
+
+
 def dryrun():
     assert args.dryrun_file is not None
     # Read dryrun file
     with open(args.dryrun_file) as f:
         data = json.load(f)
         questions = data['questions'] \
-            if not args.debug else data['questions'][:3]
-    logger.info('{} quetions read'.format(len(questions)))
+            if not args.debug else data['questions'][:2]
+    logger.info('{} questions read'.format(len(questions)))
     # Retrieve concepts
     cr = ConceptRetriever(args, updateDatabase=args.update_concepts)
     concepts = cr.get_concepts(questions)
     # Retrieve articles and snippets
     articles = dict()
-    def add_results(res):
-        articles[res['question'][0]] = res
-        write_result_articles_dry(res)
+    cb_add_results = partial(add_results, articles=articles)
     p = Pool(16)
-    for q in questions:
-        p.apply_async(query, args=(q,), callback=add_results)
+    for seq, q in enumerate(questions):
+        p.apply_async(query, args=(q, (seq, len(questions))),
+                      callback=cb_add_results)
     p.close()
     p.join()
     # RDF triples
@@ -622,6 +626,9 @@ if __name__ == '__main__':
     )
     add_arguments(parser)
     args = parser.parse_args()
+    if args.word_dict_file:
+        PATHS['word_dict_file'] = os.path.join(PATHS['data_dir'],
+                                               args.word_dict_file)
     if args.qasim_model:
         # PATHS is defined in package __init__ file
         PATHS['qasim_model'] = \
@@ -638,3 +645,13 @@ if __name__ == '__main__':
         # train2()
     elif args.mode == 'dry':
         dryrun()
+
+    # Postprocess
+    # - update word_dict (on dry run, new words can be found)
+    if re_ranker is not None:
+        re_ranker.predictor.update_word_dict()
+    if args.use_cache_scores != 4:
+        logger.info('Saving {} cached scores...'
+                    ''.format(len(doc_ranker.cached_scores)))
+        with open(PATHS['cached_scores_file'], 'wb') as f:
+            pickle.dump(dict(doc_ranker.cached_scores), f)

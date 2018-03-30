@@ -48,13 +48,11 @@ def avg_precision(y_true, y_pred):
         return ap_num / len(y_pred)
 
 
-def measure_performance(y_true, y_pred, cutoff=None):
-    if len(y_pred) > cutoff:
-        y_pred = y_pred[:cutoff]
+def measure_performance(y_true, y_pred, cutoff=10):
     precision_ = precision(y_true, y_pred)
     recall_ = recall(y_true, y_pred)
     F1 = f_measure(precision_, recall_)
-    avg_prec = avg_precision(y_true, y_pred)
+    avg_prec = avg_precision(y_true, y_pred[:cutoff])
     return precision_, recall_, F1, avg_prec
 
 
@@ -185,4 +183,8 @@ class AdaptiveRandomSearch(object):
                     self.step_size /= self.step_sizes[1]
             logger.info("> iteration {}, best {}, step_size {}"
                         ''.format(i + 1, self.current['cost'], self.step_size))
+            if self.step_size < 1e-5:
+                logger.info("> early stop (step_size {})"
+                             "".format(self.step_size))
+                break
         return self.current

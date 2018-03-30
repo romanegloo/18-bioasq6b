@@ -17,6 +17,11 @@ PATHS['concepts_db'] = os.path.join(PATHS['data_dir'], 'concepts.db')
 PATHS['qasim_model'] = os.path.join(PATHS['data_dir'],
                                     'qa_prox/var/best.mdl')
 PATHS['idf_file'] = os.path.join(PATHS['data_dir'], 'qa_prox/idf.p')
+PATHS['embedding_file'] = os.path.join(PATHS['data_dir'],
+                          'qa_prox/embeddings/wikipedia-pubmed-and-PMC-w2v.bin')
+# Cached Qa_Sim scores file
+PATHS['cached_scores_file'] = os.path.join(PATHS['runs_dir'],
+                                      'cached_scores.pkl')
 
 from . import retriever
 from .data_services import BioasqAPI

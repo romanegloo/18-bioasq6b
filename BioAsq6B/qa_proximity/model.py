@@ -8,22 +8,24 @@ from torch.autograd import Variable
 import copy
 from gensim.models.keyedvectors import KeyedVectors
 import logging
+import numpy as np
+
+from .network import QaSimBiRNN
+
 logger = logging.getLogger()
 
-from .network import QaProxBiRNN
 
-
-class QaProx(object):
-    def __init__(self, args, word_dict, feature_dict=None, state_dict=None):
+class QaSimSent(object):
+    def __init__(self, conf, word_dict, feature_dict=None, state_dict=None):
         # book-keeping
-        self.args = args
+        self.conf = conf
         self.word_dict = word_dict
         self.feature_dict = feature_dict
-        self.args.num_features = len(feature_dict) if feature_dict else 0
+        self.conf['num-features'] = len(feature_dict) if feature_dict else 0
         self.updates = 0
         self.use_cuda = False
         self.parallel = False
-        self.network = QaProxBiRNN(args)
+        self.network = QaSimBiRNN(conf)
         # load saved state, if exists
         if state_dict:
             self.network.load_state_dict(state_dict)
@@ -33,25 +35,24 @@ class QaProx(object):
         for p in self.network.encoder.parameters():
             p.requires_grad = False
         parameters = [p for p in self.network.parameters() if p.requires_grad]
-        if self.args.optimizer == 'sgd':
+        if self.conf['optimizer'] == 'sgd':
             logger.info('Optimizer: SGD (learning_rate: {} '
                         'momentum: {}, weight_decay: {})'
-                        ''.format(self.args.learning_rate, self.args.momentum,
-                                  self.args.weight_decay))
-            # self.optimizer = optim.SGD(parameters, self.args.learning_rate,
-            #                            momentum=self.args.momentum,
-            #                            weight_decay=self.args.weight_decay)
-            self.optimizer = optim.SGD(parameters, lr=0.01, momentum=0.9,
-                                       weight_decay=1e-6)
-        elif self.args.optimizer == 'adamax':
-            logger.info('Optimizer: Adamax (weight_decay: {})'
-                        ''.format(self.args.weight_decay))
-            # self.optimizer = optim.Adamax(parameters,
-            #                               weight_decay=self.args.weight_decay)
-            self.optimizer = optim.Adamax(parameters, lr=2e-3, weight_decay=0)
+                        ''.format(self.conf['learning-rate'],
+                                  self.conf['momentum'],
+                                  self.conf['weight-decay']))
+            self.optimizer = \
+                optim.SGD(parameters, self.conf['learning_rate'],
+                          momentum=self.conf['momentum'],
+                          weight_decay=self.conf['weight-decay'])
+        elif self.conf['optimizer'] == 'adamax':
+            logger.info('Optimizer: Adamax (weight-decay: {})'
+                        ''.format(self.conf['weight-decay']))
+            self.optimizer = \
+                optim.Adamax(parameters, weight_decay=self.conf['weight-decay'])
         else:
             raise RuntimeError('Unsupported optimizer: %s' %
-                               self.args.optimizer)
+                               self.conf['optimizer'])
 
     def load_embeddings(self, words, embedding_file):
         """Load pre-trained embeddings for a given list of words; assume that
@@ -71,12 +72,11 @@ class QaProx(object):
     def update(self, ex):
         """Forward a batch of examples; step the optimizer to update weights
         ex components:
-            x1, x1_f, x1_mask, x2, x2_f, x2_mask, y, qids
+            x1, x1_f, x1_mask, x2, x2_f, x2_mask, labels, qids
         """
         # Train mode
         self.network.train()
 
-        # Add process for transferring data to GPU
         if self.use_cuda:
             inputs = [e if e is None else Variable(e.cuda(async=True))
                       for e in ex[:6]]
@@ -87,7 +87,7 @@ class QaProx(object):
 
         # Run forward
         scores = self.network(*inputs)
-        # Compute loss and accuracies
+
         loss = F.binary_cross_entropy(F.sigmoid(scores), target.float())
 
         # Clear gradients and run backward
@@ -96,7 +96,7 @@ class QaProx(object):
 
         # Clip gradients
         torch.nn.utils.clip_grad_norm(self.network.parameters(),
-                                      self.args.grad_clipping)
+                                      self.conf['grad-clipping'])
 
         # Update weights
         self.optimizer.step()
@@ -104,12 +104,11 @@ class QaProx(object):
 
         return loss.data[0], ex[0].size(0)
 
-
     # --------------------------------------------------------------------------
     # Prediction
     # --------------------------------------------------------------------------
 
-    def predict(self, ex):
+    def predict(self, ex, top_n=1, max_len=None):
         # Eval mode
         self.network.eval()
 
@@ -151,13 +150,14 @@ class QaProx(object):
     # Saving and loading
     # --------------------------------------------------------------------------
 
-    def save(self, filename):
-        state_dict = copy.copy(self.network.state_dict())
+    def save(self, filename, epoch):
         params = {
-            'state_dict': state_dict,
+            'state_dict': self.network.state_dict(),
             'word_dict': self.word_dict,
             'feature_dict': self.feature_dict,
-            'args': self.args,
+            'conf': self.conf,
+            'epoch': epoch,
+            'optimizer': self.optimizer.state_dict()
         }
         try:
             torch.save(params, filename)
@@ -172,6 +172,7 @@ class QaProx(object):
         word_dict = saved_params['word_dict']
         feature_dict = saved_params['feature_dict']
         state_dict = saved_params['state_dict']
-        args = saved_params['args']
-        logger.info(args)
-        return QaProx(args, word_dict, feature_dict, state_dict=state_dict)
+        conf = saved_params['conf']
+        logger.info(conf)
+        return QaSimSent(conf, word_dict, feature_dict, state_dict=state_dict),\
+               saved_params['epoch']
