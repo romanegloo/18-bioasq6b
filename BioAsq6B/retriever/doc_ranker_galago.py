@@ -6,36 +6,36 @@ import subprocess
 import json
 import tempfile
 import sqlite3
-import os
 from collections import OrderedDict
 import re
 
 from . import DEFAULTS, utils
 from .. import PATHS
+from ..common import AverageMeter, RankedDocs
 
 logger = logging.getLogger()
 
 
-class GalagoRanker(object):
-    def __init__(self, args, ngrams=2, cached_scores=None):
+class GalagoSearch(object):
+    def __init__(self, args):
         self.args = args
         self.index_path = PATHS['galago_idx']
         self.db_path = PATHS['concepts_db']
         self.tokenizer = DEFAULTS['tokenizer']()
-        self.ngrams = ngrams
-        self.cached_scores = cached_scores
+        self.ngrams = 2
 
-    def closest_docs(self, query, k=10):
-        """Closest docs for one query"""
-        # Read from cached scores, if use_cache_scores is true
-        if self.args.use_cache_scores in [2, 4]:
-            key = query['id'] + '-ret'
-            # Make sure that enough number of results exist
-            if key in self.cached_scores:
-                docids_, scores_ = self.cached_scores[key]
-                if len(docids_) >= k and len(docids_) == len(scores_):
-                    return self.cached_scores[key]
-        # save temporary query_file for galago use
+    def closest_docs(self, query, k=10, cache=None):
+        """Return RankedDocs of k closest docs for the query"""
+        a = AverageMeter()
+        ranked_docs = RankedDocs(query)
+        # Read from cached scores, if cache is given
+        if cache is not None:
+            # Use the scores only when it has scores >= the requested number
+            if len(cache['rankings']) >= min(len(ranked_docs.rankings), k):
+                ranked_docs.rankings = cache['rankings'][:k]
+                ranked_docs.scores['retrieval'] = cache['scores-ret'][:k]
+                return ranked_docs
+        # Save temporary query_file for galago use
         if self.args.query_model == 'sdm':
             # Run two pass; one with stemmer and two without stemmer
             g_verbose = (self.args.qid is not None)
@@ -56,7 +56,6 @@ class GalagoRanker(object):
                 logger.info(p.stdout.decode('utf-8'))
             docids_scores1 = self._extract_id_scores(p.stdout.decode('utf-8'))
             # Run second pass
-            p = None
             q_tmpl['defaultTextPart'] = 'postings.krovetz'
             q_tmpl['queries'] = []
             q_obj = self.query_sdm([query], q_tmpl=q_tmpl)
@@ -67,19 +66,11 @@ class GalagoRanker(object):
             if self.args.qid is not None:
                 logger.info(p.stdout.decode('utf-8'))
             docids_scores2 = self._extract_id_scores(p.stdout.decode('utf-8'))
-            docids_scores = \
+            results = \
                 self.merge_retrieval_scores(docids_scores1, docids_scores2, k=k)
-        elif self.args.query_model == 'rm':
-            """not fully implemented"""
-            q_obj = self.query_rm([query], k)
-        else:
-            """not fully implemented"""
-            q_obj = self.query_baseline([query], k)
-
-        if self.args.use_cache_scores in [1, 3]:
-            key = query['id'] + '-ret'
-            self.cached_scores[key] = docids_scores
-        return docids_scores
+            ranked_docs.rankings, ranked_docs.scores['retrieval'] = results
+        ranked_docs.update_cache.append('retrieval')
+        return ranked_docs
 
     def merge_retrieval_scores(self, l1, l2, k=10):
         """merge two lists of scores; l1 (non-stemmer results), l2 (stemmer)"""
@@ -306,4 +297,3 @@ class GalagoRanker(object):
 
         # append TmTags
         return mesh_ui, mesh_desc
-

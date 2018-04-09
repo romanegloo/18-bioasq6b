@@ -3,6 +3,14 @@
 import time
 import random
 import logging
+import prettytable
+import re
+from termcolor import colored
+import math
+import numpy as np
+import subprocess
+
+from BioAsq6B import PATHS
 
 logger = logging.getLogger()
 
@@ -188,3 +196,141 @@ class AdaptiveRandomSearch(object):
                              "".format(self.step_size))
                 break
         return self.current
+
+
+class RankedDocs(object):
+    """A container for the reanked list of documents with scores and auxilary
+    data entities"""
+    def __init__(self, query):
+        self.query = query
+        self.rankings = []  # Ranked docs by retrieval score
+        self.rankings_fusion = []  # Final ranks after score fusion
+        self.scores = dict()  # Different kinds of scores including retrieval
+        self.docs_data = dict()
+        self.expected_docs = []
+        self.update_cache = []  # If not empty, Cache will update the scores
+        # Read expected documents (GT) if exist
+        if 'documents' in self.query:
+            for line in self.query['documents']:
+                m = re.match(".*pubmed/(\d+)$", line)
+                if m:
+                    self.expected_docs.append(m.group(1))
+
+    def read_doc_text(self, cache=None):
+        """Retrieve document in the rankings list from the galago index"""
+        for docid in self.rankings:
+            if cache is not None and docid in cache:
+                self.docs_data[docid] = cache[docid]
+                continue
+            else:
+                self.update_cache.append('documents')
+                p = subprocess.run(['galago', 'doc',
+                                    '--index={}'.format(PATHS['galago_idx']),
+                                    '--id=PMID-{}'.format(docid)],
+                                   stdout=subprocess.PIPE)
+                doc = p.stdout.decode('utf-8')
+                # find the fields in the raw text
+                fields = {'text': 'TEXT',
+                          'title': 'TITLE',
+                          'journal': 'MEDLINE_TA'}
+                doc_ = {}
+                for k, v in fields.items():
+                    tag_len = len('<{}>'.format(v))
+                    start = doc.find('<{}>'.format(v)) + tag_len
+                    end = doc.find('</{}>'.format(v))
+                    if start >= end or start <= tag_len or end <= 0:
+                        contents = ''
+                    else:
+                        contents = doc[start:end]
+                    doc_[k] = contents
+                self.docs_data[docid] = doc_
+                logger.info("reading document {} done".format(docid))
+
+    def write_result(self, printout=False, stats=None, topn=10, seq=None):
+        """Print out the results of a query with the performance measures"""
+        # Set tabular format for eval results
+        table = prettytable.PrettyTable(['Question', 'GT', 'Returned',
+                                         'Scores'])
+        table.align['Question'] = 'l'
+        table.align['Returned'] = 'r'
+        table.max_width['Question'] = 40
+        col0 = '[{}]\n{}'.format(self.query['id'], self.query['body'])
+        if 'ideal_answer' in self.query:
+            col0 += '\n=> {}'.format(self.query['ideal_answer'])
+        col1 = '\n'.join(self.expected_docs)
+        col2 = []  # Returned documents
+        col3 = []  # Scores
+        for docid in self.rankings_fusion[:topn]:
+            docid_ = \
+                colored(docid, 'blue') if docid in self.expected_docs else docid
+            col2.append('{:>8}'.format(docid_))
+            idx = self.rankings.index(docid)
+            scores_ = "{:.2f}".format(self.scores['retrieval'][idx])
+            # todo. add other kinds of scores (like reranking scores)
+            if 'qasim' in self.scores:
+                scores_ += "/{:.2f}".format(np.max(self.scores['qasim'][idx]))
+            if 'journal' in self.scores:
+                scores_ += "/{:.2f}".format(np.max(self.scores['journal'][idx]))
+            scores_ = "{:.4f} ({})".format(self.scores['fusion'][idx], scores_)
+            col3.append(scores_)
+        col2 = '\n'.join(col2)
+        col3 = '\n'.join(col3)
+        table.add_row([col0, col1, col2, col3])
+        if len(self.expected_docs) > 0 and stats is not None:
+            prec, recall, f1, ap = \
+                measure_performance(self.expected_docs, self.rankings_fusion,
+                                    cutoff=topn)
+            # Update statistics
+            stats['avg_prec'].update(prec)
+            stats['avg_recall'].update(recall)
+            stats['avg_f1'].update(f1)
+            stats['map'].update(ap)
+            stats['logp'].update(math.log(prec + 1e-6))
+            report = ('precision: {:.4f}, recall: {:.4f}, F1: {:.4f}, '
+                      'avg_prec_10: {:.4f}').format(prec, recall, f1, ap)
+        else:
+            report = ''
+        if printout:
+            logger.info("Details:\n" + table.get_string() + "\n")
+        if seq is not None:
+            line = '[seq. {}/{}] {}'.format(*seq, report)
+        else:
+            line = '{}'.format(report)
+        logger.info(line)
+        return
+
+    def merge_scores(self, weights_str):
+        # Merge different set of scores into "fusion" scores
+        # todo. compare with [merge_scores] in rerank_qaprox.py
+        ndocs = len(self.scores['retrieval'])
+        weights = {}
+        for w in weights_str.split(','):
+            k, v = w.split(':')
+            if k == 'retrieval':
+                weights['retrieval'] = float(v)
+            if k == 'qasim':
+                weights['qasim'] = float(v)
+            if k == 'journal':
+                weights['journal'] = float(v)
+
+        # Initialize rankings_fusion with retrieval scores
+        self.rankings_fusion = self.rankings
+        # Normalize the retrieval scores
+        ret_norm = list(map(lambda x: math.exp(x), self.scores['retrieval']))
+        ret_norm = [float(s)/sum(ret_norm) for s in ret_norm]
+        self.scores['fusion'] = ret_norm
+        if len(weights.keys()) == 0:
+            return
+        fusion = weights['retrieval'] * ndocs * np.array(ret_norm)
+        if 'qasim' in weights and 'qasim' in self.scores:
+            for i, score in enumerate(self.scores['qasim']):
+                fusion[i] += np.max(score) * weights['qasim']
+        if 'journal' in weights and 'journal' in self.scores:
+            fusion += np.array(self.scores['journal']) * weights['journal']
+        self.scores['fusion'] = fusion.tolist()
+        # Order by fusion scores
+        self.rankings_fusion = \
+            [docid for _, docid
+             in sorted(zip(self.scores['fusion'], self.rankings),
+                       key=lambda pair: pair[0], reverse=True)]
+

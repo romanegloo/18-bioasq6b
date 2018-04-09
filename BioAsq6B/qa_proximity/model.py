@@ -173,6 +173,5 @@ class QaSimSent(object):
         feature_dict = saved_params['feature_dict']
         state_dict = saved_params['state_dict']
         conf = saved_params['conf']
-        logger.info(conf)
         return QaSimSent(conf, word_dict, feature_dict, state_dict=state_dict),\
                saved_params['epoch']

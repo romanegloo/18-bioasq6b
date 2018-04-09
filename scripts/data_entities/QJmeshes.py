@@ -12,7 +12,7 @@ import pickle
 
 data_dir = Path(__file__).absolute().parents[3] / 'data'
 t_file = (data_dir / 'bioasq/train/BioASQ-trainingDataset6b.json').as_posix()
-    j_file = (data_dir / 'nlmcatalog_result.xml').as_posix()
+j_file = (data_dir / 'nlmcatalog_result.xml').as_posix()
 db_file = (data_dir / 'concepts.db').as_posix()
 galago_idx = (data_dir / 'galago-medline-full-idx').as_posix()
 output_file = data_dir / 'journal_mesh_dist.pkl'

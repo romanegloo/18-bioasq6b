@@ -35,5 +35,5 @@ logger.info('{} quetions read'.format(len(questions)))
 
 # questions = questions[:3]
 # Retrieve concepts
-cr = ConceptRetriever(args, updateDatabase=True)
+cr = ConceptRetriever(updateDatabase=True)
 concepts = cr.get_concepts(questions)

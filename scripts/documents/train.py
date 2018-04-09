@@ -28,12 +28,12 @@ from BioAsq6B.common import Timer, AverageMeter, measure_performance
 
 logger = logging.getLogger()
 doc_ranker = None
-re_ranker = None
+qasim_ranker = None
 questions = []
 
 
 def init():
-    global doc_ranker, re_ranker, questions
+    global doc_ranker, qasim_ranker, questions
 
     logger.setLevel(logging.DEBUG)
     # also use this logger in the multiprocessing module
@@ -82,7 +82,7 @@ def init():
         retriever.get_class('galago')(args, cached_retrievals=cached_retrievals)
     if args.rerank:
         logger.info('Initializing re-ranker...')
-        re_ranker = reranker.RerankQaProx(args, cached_scores=cached_scores)
+        re_ranker = reranker.RerankQaSim(args, cached_scores=cached_scores)
         if args.print_parameters:
             from BioAsq6B.qa_proximity import utils
             model_summary = utils.torch_summarize(re_ranker.predictor.model)
@@ -163,9 +163,9 @@ def query(q, seq=None):
         results['seq'] = seq
     (docids, ret_scores) = doc_ranker.closest_docs(q, k=args.ndocs)
     if args.rerank:
-        rel_scores = re_ranker.get_prox_scores(docids, q)
-        results['scores'] = re_ranker.merge_scores(args.score_weights, docids,
-                                                   ret_scores, rel_scores)
+        rel_scores = qasim_ranker.get_prox_scores(docids, q)
+        results['scores'] = qasim_ranker.merge_scores(args.score_weights, docids,
+                                                      ret_scores, rel_scores)
     else:
         _scores = {docid: {'ret_score': score, 'score': score}
                    for docid, score in zip(docids, ret_scores)}
@@ -275,7 +275,7 @@ def run(questions, epoch_no):
     # if caching score is enabled, store the scores
     if args.cache_scores:
         logger.info("Proximity Scores are saved")
-        pickle.dump(dict(re_ranker.cached_scores),
+        pickle.dump(dict(qasim_ranker.cached_scores),
                     open(args.score_datafile, 'wb'))
 
     # Returns 'map' score to validate the best

@@ -61,12 +61,12 @@ class Predictor(object):
                        qtype=None):
         """Feed in to the model and get scores in batch"""
         if question:
-            self._set_q(question, qtype)
+            self.set_q(question, qtype)
         batch_t, sentences_t = self._build_ex(title)
         pred_t = self.model.predict(batch_t)
         batch_b, sentences_b = self._build_ex(body)
         pred_b = self.model.predict(batch_b)
-        res = F.sigmoid(torch.cat((pred_t, pred_b), dim=0)).data.numpy()
+        res = F.sigmoid(torch.cat((pred_t, pred_b), dim=0)).data.tolist()
         snippets = []
         tmpl_ = "http://www.ncbi.nlm.nih.gov/pubmed/{}"
         for i, sent in enumerate(sentences_t + sentences_b):
@@ -109,7 +109,7 @@ class Predictor(object):
         :return:
         """
         if question:
-            self._set_q(question, qtype)
+            self.set_q(question, qtype)
         ex, _ = self._build_ex(context)
         pred = self.model.predict(ex)
         res = F.sigmoid(pred).data.squeeze()
@@ -125,7 +125,7 @@ class Predictor(object):
             snippets.append(entry)
         return res, snippets
 
-    def _set_q(self, q, qtype):
+    def set_q(self, q, qtype):
         self.q_ex, self.q_f, self.q_mask = self._encode_q(q, qtype)
 
     def _encode_q(self, q, qtype):

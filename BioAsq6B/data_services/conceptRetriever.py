@@ -19,8 +19,7 @@ logging.getLogger("urllib3").setLevel(logging.WARNING)
 
 
 class ConceptRetriever(object):
-    def __init__(self, args, updateDatabase=False):
-        self.args = args
+    def __init__(self, updateDatabase=False):
         self.concepts = dict()
         self.updateDatabase = updateDatabase
         self.db = PATHS['concepts_db']
