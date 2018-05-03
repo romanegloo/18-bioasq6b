@@ -13,7 +13,7 @@ import numpy as np
 from .network import QaSimBiRNN
 
 logger = logging.getLogger()
-
+logging.getLogger("gensim.models.keyedvectors").setLevel(logging.ERROR)
 
 class QaSimSent(object):
     def __init__(self, conf, word_dict, feature_dict=None, state_dict=None):
@@ -64,10 +64,26 @@ class QaSimSent(object):
         for w in words:
             if w in w2v_model:
                 vec = torch.from_numpy(w2v_model[w])
-                # vec = torch.FloatTensor([float(i) for i in w2v_model[w]])
                 embedding[self.word_dict[w]] = vec
         logger.info('Copied %d embeddings (%.2f%%)' %
                     (len(embedding), 100 * len(embedding) / len(words)))
+
+    def update_embeddings(self, words, embedding_file):
+        """Updating this models embeddings with unseen words for later use"""
+        embedding = self.network.encoder.weight.data
+        w2v_model = KeyedVectors.load_word2vec_format(embedding_file,
+                                                      binary=True)
+        cnt = 0
+        for w in words:
+            if w in w2v_model:
+                cnt += 1
+                vec = torch.from_numpy(w2v_model[w]).float().unsqueeze(0)
+                embedding = torch.cat((embedding, vec))
+                self.word_dict[w] = len(self.word_dict)
+        logger.info('Added {} embeddings ({:.2f}%)'
+                    ''.format(cnt, 100 * cnt / len(words)))
+        self.network.encoder.weight.data = embedding
+        self.conf['vocab-size'] = len(self.word_dict)
 
     def update(self, ex):
         """Forward a batch of examples; step the optimizer to update weights
@@ -87,7 +103,6 @@ class QaSimSent(object):
 
         # Run forward
         scores = self.network(*inputs)
-
         loss = F.binary_cross_entropy(F.sigmoid(scores), target.float())
 
         # Clear gradients and run backward
@@ -108,10 +123,12 @@ class QaSimSent(object):
     # Prediction
     # --------------------------------------------------------------------------
 
-    def predict(self, ex, top_n=1, max_len=None):
+    def predict(self, ex, max_score=False):
+        if ex is None:
+            return Variable(torch.FloatTensor([0]))
+
         # Eval mode
         self.network.eval()
-
         # Transfer to GPU
         if self.use_cuda:
             inputs = [e if e is None else
@@ -120,11 +137,12 @@ class QaSimSent(object):
         else:
             inputs = [e if e is None else Variable(e, volatile=True)
                       for e in ex[:6]]
-
         # Forward
         scores = self.network(*inputs)
-        return scores
-
+        if max_score:
+            return scores.max()
+        else:
+            return scores
 
     # --------------------------------------------------------------------------
     # Runtime
@@ -145,19 +163,16 @@ class QaSimSent(object):
         self.parallel = True
         self.network = torch.nn.DataParallel(self.network)
 
-
     # --------------------------------------------------------------------------
     # Saving and loading
     # --------------------------------------------------------------------------
 
-    def save(self, filename, epoch):
+    def save(self, filename):
         params = {
             'state_dict': self.network.state_dict(),
             'word_dict': self.word_dict,
             'feature_dict': self.feature_dict,
             'conf': self.conf,
-            'epoch': epoch,
-            'optimizer': self.optimizer.state_dict()
         }
         try:
             torch.save(params, filename)
@@ -167,11 +182,13 @@ class QaSimSent(object):
     @staticmethod
     def load(filename):
         logger.info('Loading QA_Prox model {}'.format(filename))
-        saved_params = torch.load(filename,
-                                   map_location=lambda storage, loc: storage)
+        saved_params = torch.load(
+            filename, map_location=lambda storage, loc: storage
+        )
         word_dict = saved_params['word_dict']
         feature_dict = saved_params['feature_dict']
         state_dict = saved_params['state_dict']
+        epoch = saved_params['epoch'] if 'epoch' in saved_params else 0
         conf = saved_params['conf']
         return QaSimSent(conf, word_dict, feature_dict, state_dict=state_dict),\
-               saved_params['epoch']
+               epoch

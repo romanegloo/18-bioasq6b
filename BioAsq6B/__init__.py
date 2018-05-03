@@ -17,11 +17,13 @@ PATHS['qasim_model'] = os.path.join(PATHS['data_dir'], 'qa_prox/var/best.mdl')
 PATHS['idf_file'] = os.path.join(PATHS['data_dir'], 'qa_prox/idf.p')
 PATHS['embedding_file'] = os.path.join(PATHS['data_dir'],
                           'qa_prox/embeddings/wikipedia-pubmed-and-PMC-w2v.bin')
+PATHS['mysqldb_cred_file'] = os.path.join(PATHS['data_dir'], 'db_cred.csv')
+PATHS['metamap_bin'] = '/home/jno236/opt/public_mm/bin/metamap'
+
 # Cached Qa_Sim scores file
 PATHS['cached_scores_file'] = \
     os.path.join(PATHS['runs_dir'], 'cached_scores.pkl')
 PATHS['cached_docs_file'] = os.path.join(PATHS['runs_dir'], 'cached_docs.pkl')
 
 from . import retriever
-from .cache import Cache
 from .data_services import BioasqAPI

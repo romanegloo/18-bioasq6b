@@ -1,15 +1,8 @@
 #!/usr/bin/env python3
 """use pre-trained QA_Sim model to re-rank retrieved list of documents"""
 
-import subprocess
-import spacy
 import logging
-import traceback
-from collections import OrderedDict
-import numpy as np
 import pickle
-import os
-from multiprocessing import Manager
 
 from BioAsq6B import PATHS
 from BioAsq6B.qa_proximity import Predictor
@@ -18,11 +11,10 @@ logger = logging.getLogger()
 
 
 class RerankQaSim(object):
-    def __init__(self, args):
+    def __init__(self, args, nlp=None):
         self.args = args
-        logger.info('loading spacy nlp tools...')
-        self.nlp = spacy.load('en')
-        self.predictor = Predictor(args)
+        self.nlp = nlp
+        self.predictor = Predictor(args, nlp=nlp)
 
     def get_qasim_scores(self, ranked_docs, cache=None):
         """Compute the QA_Sim scores over the list of documents.
@@ -32,36 +24,38 @@ class RerankQaSim(object):
         self.predictor.set_q(q['body'], q['type'])
         # If cache is given, read cached scores and extract snippets
         k = len(ranked_docs.rankings)
-        if cache is not None and 'scores-qasim' in cache \
-                and cache['scores-qasim'] is not None:
-            if len(cache['scores-qasim']) >= k:
-                scores_ = []
-                for docid in ranked_docs.rankings:
-                    if docid in cache['scores-qasim']:
-                        scores_.append(np.max(cache['scores-qasim'][docid]))
-                    else:
-                        s, _ = self.predictor.predict_prob_b(
-                            ranked_docs.docs_data[docid]['text'],
-                            ranked_docs.docs_data[docid]['title'],
-                            docid=docid
-                        )
-                        scores_.append(np.max(s))
-                ranked_docs.scores['qasim'] = scores_[:k]
-                if self.args.verbose:
-                    logger.info('analyzing qasim relevance of qid #{}.'
-                                ''.format(q['id']))
-                return
-        # If cache is not given
-        if self.args.verbose:
-            logger.info('analyzing qasim relevance of qid #{}'.format(q['id']))
-        ranked_docs.update_cache.append('qasim')
-        rel_scores = []
+        # Validate qasim_scores; Qasim score for a docid should be given in
+        # an array format
+        scores_ = []
+        snippets_ = []
         for docid in ranked_docs.rankings:
-            scores, _ = self.predictor.predict_prob_b(
-                ranked_docs.docs_data[docid]['text'],
-                ranked_docs.docs_data[docid]['title'], docid=docid)
-            rel_scores.append(np.max(scores))
-        ranked_docs.scores['qasim'] = rel_scores[:k]
+            use_cache_scores = True
+            if cache is None:
+                use_cache_scores = False
+            if not use_cache_scores or 'scores-qasim' not in cache \
+                    or type(cache['scores-qasim']) != dict\
+                    or docid not in cache['scores-qasim']:
+                use_cache_scores = False
+            if not use_cache_scores \
+                    or type(cache['scores-qasim'][docid]) != list:
+                use_cache_scores = False
+            if use_cache_scores:
+                s = cache['scores-qasim'][docid]
+                scores_.append(s)
+            else:
+                logger.info('qasim for qid {} docid {}'.format(q['id'], docid))
+                if 'qasim' not in ranked_docs.update_cache:
+                    ranked_docs.update_cache.append('qasim')
+                s, t = self.predictor.predict_prob_b(
+                    ranked_docs.docs_data[docid]['text'],
+                    ranked_docs.docs_data[docid]['title'],
+                    docid=docid
+                )
+                scores_.append(s)
+                snippets_.extend(t)
+        ranked_docs.scores['qasim'] = scores_[:k]
+        ranked_docs.text_snippets = \
+            sorted(snippets_, key=lambda t: t[1], reverse=True)
 
     def get_sentence(self, docid, text):
         """read document and split by sentence, and yield each sentence"""

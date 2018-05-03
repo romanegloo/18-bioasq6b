@@ -10,8 +10,9 @@ Requires spaCy package and the spaCy english model.
 """
 
 import spacy
+from spacy.tokenizer import Tokenizer
 import copy
-from .tokenizer import Tokens, Tokenizer
+from .tokenizer import Tokens
 
 
 class SpacyTokenizer(Tokenizer):
@@ -30,11 +31,12 @@ class SpacyTokenizer(Tokenizer):
         if not {'ner'} & self.annotators:
             nlp_kwargs['entity'] = False
         self.nlp = spacy.load(model, **nlp_kwargs)
+        self.tokenizer = Tokenizer(self.nlp.vocab)
 
     def tokenize(self, text):
         # We don't treat new lines as tokens.
         clean_text = text.replace('\n', ' ').replace('"', ' ')
-        tokens = self.nlp.tokenizer(clean_text)
+        tokens = self.tokenizer(clean_text)
         if {'lemma', 'pos', 'ner'} & self.annotators:
             self.nlp.tagger(tokens)
         if {'ner'} & self.annotators:

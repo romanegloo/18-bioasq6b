@@ -9,6 +9,8 @@ from termcolor import colored
 import math
 import numpy as np
 import subprocess
+from multiprocessing import Pool
+from functools import partial
 
 from BioAsq6B import PATHS
 
@@ -75,6 +77,9 @@ class AverageMeter(object):
     def __init__(self):
         self.reset()
 
+    def __repr__(self):
+        return str(self.avg)
+
     def reset(self):
         self.val = 0
         self.avg = 0
@@ -121,11 +126,12 @@ class Timer(object):
 
 
 class AdaptiveRandomSearch(object):
-    def __init__(self, bounds, obj_fn, init_vec=None, \
-                 max_iter=100, max_no_impr=3):
+    def __init__(self, bounds, obj_fn, init_vec=None, data=None,
+                 max_iter=100, max_no_impr=5):
+        self.data = data
         self.bounds = bounds
-        self.iter_mult = 5  # 1 in *iter_mul*, use the largest step size
-        self.step_sizes = [0.05, 2.0, 3.0]  # initial/small/large factors
+        self.iter_mult = 5  # once in *iter_mul*, use the largest step size
+        self.step_sizes = [1.00, 1.5, 3.0]  # initial/small/large factors
         self.step_size = (bounds[0][1] - bounds[0][0]) * self.step_sizes[0]
         self.current = dict()
         if init_vec:
@@ -156,29 +162,32 @@ class AdaptiveRandomSearch(object):
             min_ = max(self.bounds[i][0], v[i] - step_size)
             max_ = min(self.bounds[i][1], v[i] + step_size)
             position.append(self.rand_in_bounds(min_, max_))
-        return position
+        # Normalize
+        return [w/sum(position) for w in position]
 
     def take_steps(self, step_size, big_stepsize):
         step = dict()
         big_step = dict()
         step['vector'] = self.take_step(step_size)
-        step['cost'] = self.objective_function(step['vector'])
+        step['cost'] = self.objective_function(step['vector'], self.data)
         big_step['vector'] = self.take_step(big_stepsize)
-        big_step['cost'] = self.objective_function(big_step['vector'])
+        big_step['cost'] = \
+            self.objective_function(big_step['vector'], self.data)
         return step, big_step
 
     def search(self):
         count = 0
-        self.current['cost'] = self.objective_function(self.current['vector'])
+        self.current['cost'] = \
+            self.objective_function(self.current['vector'], self.data)
         for i in range(self.max_iter):
             big_stepsize = self.large_step_size(i)
             # Get the regular and large step size
             step, big_step = self.take_steps(self.step_size, big_stepsize)
             # Compare the costs
-            if step['cost'] <= self.current['cost'] or \
-                    big_step['cost'] <= self.current['cost']:
+            if step['cost'] < self.current['cost'] or \
+                    big_step['cost'] < self.current['cost']:
                 count = 0
-                if big_step['cost'] <= self.current['cost']:
+                if big_step['cost'] < self.current['cost']:
                     self.step_size, self.current = big_stepsize, big_step
                 else:
                     self.current = step
@@ -192,8 +201,8 @@ class AdaptiveRandomSearch(object):
             logger.info("> iteration {}, best {}, step_size {}"
                         ''.format(i + 1, self.current['cost'], self.step_size))
             if self.step_size < 1e-5:
-                logger.info("> early stop (step_size {})"
-                             "".format(self.step_size))
+                logger.info('> early stop (step_size {})'
+                            ''.format(self.step_size))
                 break
         return self.current
 
@@ -209,6 +218,8 @@ class RankedDocs(object):
         self.docs_data = dict()
         self.expected_docs = []
         self.update_cache = []  # If not empty, Cache will update the scores
+        self.unseen_words = set()
+        self.text_snippets = []
         # Read expected documents (GT) if exist
         if 'documents' in self.query:
             for line in self.query['documents']:
@@ -216,35 +227,46 @@ class RankedDocs(object):
                 if m:
                     self.expected_docs.append(m.group(1))
 
+    @staticmethod
+    def galago_read_doc(docid):
+        p = subprocess.run(
+            ['galago', 'doc', '--index={}'.format(PATHS['galago_idx']),
+             '--id=PMID-{}'.format(docid)],
+            stdout=subprocess.PIPE
+        )
+        doc = p.stdout.decode('utf-8')
+        # find the fields in the raw text
+        fields = {'text': 'TEXT', 'title': 'TITLE', 'journal': 'MEDLINE_TA'}
+        doc_ = dict()
+        for k, v in fields.items():
+            tag_len = len('<{}>'.format(v))
+            start = doc.find('<{}>'.format(v)) + tag_len
+            end = doc.find('</{}>'.format(v))
+            if start >= end or start <= tag_len or end <= 0:
+                contents = ''
+            else:
+                contents = doc[start:end]
+            doc_[k] = contents
+        return doc_
+
+    def cb_galago_read_doc(self, res, docid=None):
+        self.update_cache.append('documents')
+        self.docs_data[docid] = res
+        logger.info("reading document {} done".format(docid))
+
     def read_doc_text(self, cache=None):
         """Retrieve document in the rankings list from the galago index"""
+        p = Pool(16)
         for docid in self.rankings:
             if cache is not None and docid in cache:
                 self.docs_data[docid] = cache[docid]
                 continue
             else:
-                self.update_cache.append('documents')
-                p = subprocess.run(['galago', 'doc',
-                                    '--index={}'.format(PATHS['galago_idx']),
-                                    '--id=PMID-{}'.format(docid)],
-                                   stdout=subprocess.PIPE)
-                doc = p.stdout.decode('utf-8')
-                # find the fields in the raw text
-                fields = {'text': 'TEXT',
-                          'title': 'TITLE',
-                          'journal': 'MEDLINE_TA'}
-                doc_ = {}
-                for k, v in fields.items():
-                    tag_len = len('<{}>'.format(v))
-                    start = doc.find('<{}>'.format(v)) + tag_len
-                    end = doc.find('</{}>'.format(v))
-                    if start >= end or start <= tag_len or end <= 0:
-                        contents = ''
-                    else:
-                        contents = doc[start:end]
-                    doc_[k] = contents
-                self.docs_data[docid] = doc_
-                logger.info("reading document {} done".format(docid))
+                cb_fn = partial(self.cb_galago_read_doc, docid=docid)
+                p.apply_async(self.galago_read_doc, args=(docid,),
+                              callback=cb_fn)
+        p.close()
+        p.join()
 
     def write_result(self, printout=False, stats=None, topn=10, seq=None):
         """Print out the results of a query with the performance measures"""
@@ -257,7 +279,12 @@ class RankedDocs(object):
         col0 = '[{}]\n{}'.format(self.query['id'], self.query['body'])
         if 'ideal_answer' in self.query:
             col0 += '\n=> {}'.format(self.query['ideal_answer'])
-        col1 = '\n'.join(self.expected_docs)
+        col1 = []
+        for docid in self.expected_docs:
+            docid_ = colored(docid, 'yellow') \
+                if docid in self.rankings_fusion else docid
+            col1.append(docid_)
+        col1 = '\n'.join(col1)
         col2 = []  # Returned documents
         col3 = []  # Scores
         for docid in self.rankings_fusion[:topn]:
@@ -266,11 +293,14 @@ class RankedDocs(object):
             col2.append('{:>8}'.format(docid_))
             idx = self.rankings.index(docid)
             scores_ = "{:.2f}".format(self.scores['retrieval'][idx])
-            # todo. add other kinds of scores (like reranking scores)
             if 'qasim' in self.scores:
                 scores_ += "/{:.2f}".format(np.max(self.scores['qasim'][idx]))
             if 'journal' in self.scores:
                 scores_ += "/{:.2f}".format(np.max(self.scores['journal'][idx]))
+            if 'semmeddb' in self.scores:
+                scores_ += '/({}/{:.2f})' \
+                           ''.format(self.scores['semmeddb'][idx][0],
+                                     self.scores['semmeddb'][idx][1])
             scores_ = "{:.4f} ({})".format(self.scores['fusion'][idx], scores_)
             col3.append(scores_)
         col2 = '\n'.join(col2)
@@ -292,26 +322,29 @@ class RankedDocs(object):
             report = ''
         if printout:
             logger.info("Details:\n" + table.get_string() + "\n")
-        if seq is not None:
-            line = '[seq. {}/{}] {}'.format(*seq, report)
-        else:
-            line = '{}'.format(report)
-        logger.info(line)
+            if seq is not None:
+                line = '[seq. {}/{}] {}'.format(*seq, report)
+            else:
+                line = '{}'.format(report)
+            logger.info(line)
         return
 
     def merge_scores(self, weights_str):
         # Merge different set of scores into "fusion" scores
-        # todo. compare with [merge_scores] in rerank_qaprox.py
         ndocs = len(self.scores['retrieval'])
         weights = {}
         for w in weights_str.split(','):
             k, v = w.split(':')
             if k == 'retrieval':
                 weights['retrieval'] = float(v)
-            if k == 'qasim':
+            elif k == 'qasim':
                 weights['qasim'] = float(v)
-            if k == 'journal':
+            elif k == 'journal':
                 weights['journal'] = float(v)
+            elif k == 'semmeddb1':
+                weights['semmeddb1'] = float(v)
+            elif k == 'semmeddb2':
+                weights['semmeddb2'] = float(v)
 
         # Initialize rankings_fusion with retrieval scores
         self.rankings_fusion = self.rankings
@@ -327,6 +360,11 @@ class RankedDocs(object):
                 fusion[i] += np.max(score) * weights['qasim']
         if 'journal' in weights and 'journal' in self.scores:
             fusion += np.array(self.scores['journal']) * weights['journal']
+        if 'semmeddb1' in weights and 'semmeddb2' in weights \
+            and 'semmeddb' in self.scores:
+            for i, scores in enumerate(self.scores['semmeddb']):
+                fusion[i] += scores[0] * weights['semmeddb1'] + \
+                             scores[1] * weights['semmeddb2']
         self.scores['fusion'] = fusion.tolist()
         # Order by fusion scores
         self.rankings_fusion = \
@@ -334,3 +372,21 @@ class RankedDocs(object):
              in sorted(zip(self.scores['fusion'], self.rankings),
                        key=lambda pair: pair[0], reverse=True)]
 
+
+# Commonly used functions
+def keys_exists(element, *keys):
+    '''
+    Check if *keys (nested) exists in `element` (dict).
+    '''
+    if type(element) is not dict:
+        raise AttributeError('keys_exists() expects dict as first argument.')
+    if len(keys) == 0:
+        raise AttributeError('keys_exists() expects at least two arguments, one given.')
+
+    _element = element
+    for key in keys:
+        try:
+            _element = _element[key]
+        except KeyError:
+            return False
+    return True

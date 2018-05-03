@@ -5,10 +5,11 @@ import logging
 import json
 import requests
 import urllib.parse
-import time
 import sys
 from tqdm import tqdm
-import sqlite3
+import pymysql
+import time
+
 from . import MetamapExt
 from .. import PATHS
 
@@ -20,9 +21,38 @@ logging.getLogger("urllib3").setLevel(logging.WARNING)
 
 class ConceptRetriever(object):
     def __init__(self, updateDatabase=False):
-        self.concepts = dict()
+        self.concepts = list()
         self.updateDatabase = updateDatabase
-        self.db = PATHS['concepts_db']
+        self.cnx = None
+        self.db_connect()
+
+    def db_connect(self):
+        # Read DB credential
+        if self.cnx is not None and self.cnx.open:
+            return
+        # Read DB credential
+        try:
+            with open(PATHS['mysqldb_cred_file']) as f:
+                host, user, passwd, dbname = f.readline().split(',')
+            self.cnx = pymysql.connect(
+                host=host, user=user, password=passwd, db=dbname,
+                charset='utf8', cursorclass=pymysql.cursors.DictCursor,
+                connect_timeout=2*60*60
+            )
+        except (pymysql.err.DatabaseError,
+                pymysql.err.IntegrityError,
+                pymysql.err.MySQLError) as exception:
+            logger.error('DB connection failed: {}'.format(exception))
+            raise
+        finally:
+            if self.cnx is None:
+                logger.error('Problem connecting to database')
+            else:
+                logger.debug('Concept DB connected')
+
+    def db_close(self):
+        if self.cnx and self.cnx.open:
+            self.cnx.close()
 
     def run_tmtools(self, questions):
         """Using TmTools to extract concepts from question texts
@@ -88,6 +118,7 @@ class ConceptRetriever(object):
                 e = sys.exc_info()[0]
                 logger.error("Cannot load response in JSON: {}".format(e))
                 return
+            qids = [c['id'] for c in self.concepts]
             for q_resp in data:
                 for concept in q_resp['denotations']:
                     b = concept['span']['begin']
@@ -95,35 +126,44 @@ class ConceptRetriever(object):
                     term = q_resp['text'][b:e]
                     # term = term.replace(';', ' ')
                     entry = {
+                        'id': q_resp['sourceid'],
                         'source': "TmTools ({})".format(trigger),
                         'cid': concept['obj'],
-                        'name0': term,
-                        'nameN': term
+                        'name_0': term,
+                        'name_norm': term
                     }
-                    if q_resp['sourceid'] not in self.concepts:
-                        self.concepts[q_resp['sourceid']] = []
-                    self.concepts[q_resp['sourceid']].append(entry)
+                    self.concepts.append(entry)
 
     def run_metamap(self, questions):
         """Runs MataMap to extract MeSH concepts"""
         # get MeSH terms
         logger.info('Extracting MeSH terms from the questions...')
         mm = MetamapExt()
-        for q in tqdm(questions, desc='MetaMap runs'):
-            rec = mm.get_mesh_descriptors(q['body'])
-            tags = set()
-            for concept in rec:
+        for q in tqdm(questions, desc='MetaMap Runs'):
+            cuis, meshes = mm.get_concepts(q['body'])
+            # CUIs
+            for concept in cuis:
                 entry = {
-                    'source': "MetaMap",
-                    'cid': concept[1],
-                    'name0': concept[2].replace(';', ''),
-                    'nameN': concept[2].replace(';', '')
+                    'id': q['id'],
+                    'source': 'MetaMap (CUI)',
+                    'cid': concept[0],
+                    'name_0': concept[1].replace(';', ''),
+                    'name_norm': concept[1].replace(';', '')
                 }
-                if q['id'] not in self.concepts:
-                    self.concepts[q['id']] = []
-                if concept[1] not in tags:
-                    tags.add(concept[1])
-                    self.concepts[q['id']].append(entry)
+                self.concepts.append(entry)
+            # MeSHes
+            for concept in meshes:
+                tags = set()
+                entry = {
+                    'id': q['id'],
+                    'source': 'MetaMap (MeSH)',
+                    'cid': concept['mesh_id'],
+                    'name_0': concept['name'].replace(';', ''),
+                    'name_norm': concept['name'].replace(';', '')
+                }
+                if concept['mesh_id'] not in tags:
+                    tags.add(concept['mesh_id'])
+                    self.concepts.append(entry)
 
     def run_go_expand(self):
         """This does not require the list of questions.
@@ -133,13 +173,12 @@ class ConceptRetriever(object):
         ontology."""
         logger.info('Expanding gene ontology concepts...')
         genes = dict()
-        for qid, concepts in self.concepts.items():
-            for c in concepts:
-                if c['source'] in ['TmTools (Gene)', 'TmTools (Mutation)']:
-                    for ptn in ['Species']:
-                        if ptn in c['cid']:
-                            continue
-                    genes[c['name0']] = qid
+        for c in self.concepts:
+            if c['source'] in ['TmTools (Gene)', 'TmTools (Mutation)']:
+                for ptn in ['Species']:
+                    if ptn in c['cid']:
+                        continue
+                genes[c['name_0']] = c['id']
         if len(genes) <= 0:
             return
         # Prepare GO request
@@ -189,7 +228,7 @@ class ConceptRetriever(object):
                 rst = None
                 logger.error("GO API request failed: %s" % r.text)
 
-            if rst:
+            if r:
                 # Process the response
                 num_found = rst['response']['numFound']
                 if num_found == 0:
@@ -200,75 +239,59 @@ class ConceptRetriever(object):
                     print(g, genes[g], d['id'])
                     cnt += 1
                     entry = {
+                        'id': genes[g],
                         'source': "GO",
                         'cid': d['id'],
-                        'name0': g,
-                        'nameN': d['annotation_class_label']
+                        'name_0': g,
+                        'name_norm': d['annotation_class_label']
                     }
-                    self.concepts[genes[g]].append(entry)
+                    self.concepts.append(entry)
                     if cnt > 10:
                         break
 
     def update_database(self):
         records = []
-        qids = []
-        for k, v in tqdm(self.concepts.items(), desc="Concepts DB"):
-            if k not in qids:
-                qids.append(k)
-            for c in v:
-                records.append((k, c['source'], c['cid'], c['name0'],
-                                c['nameN']))
-        # Delete existing rows with the question ids
-        cnx = sqlite3.connect(self.db)
-        # csr = cnx.cursor()
-        # csr.execute("DELETE FROM concepts2 WHERE id in ({})"
-        #             "".format(', '.join(['?' for _ in qids])), qids)
-        # logger.info('{} concepts are deleted.'.format(csr.rowcount))
-        # cnx.commit()
+        for c in tqdm(self.concepts, desc="Concepts DB"):
+            records.append((c['id'], c['source'], c['cid'], c['name_0'],
+                            c['name_norm']))
+        self.cnx = None
+        self.db_connect()
+
         if len(records) > 0:
-            logger.info('Storing concepts into db...')
-            csr = cnx.cursor()
-            csr.executemany("INSERT OR REPLACE INTO concepts2 "
-                            "VALUES (?,?,?,?,?);", records)
-            logger.info('{} concepts stored in DB'.format(csr.rowcount))
-            cnx.commit()
-        cnx.close()
+            with self.cnx.cursor() as cursor:
+                sql = "REPLACE INTO BIOASQ_CONCEPT VALUES (%s, %s, %s, %s, %s);"
+                cursor.executemany(sql, records)
+                logger.info('{} concepts updated in concepts DB'
+                            ''.format(cursor.rowcount))
+            self.cnx.commit()
+        else:
+            logger.warning('\nNothing to update in concepts DB')
 
     def read_from_db(self, questions):
+        self.db_connect()
         assert len(self.concepts) == 0
         records = [q['id'] for q in questions]
-        cnx = sqlite3.connect(self.db)
-        csr = cnx.cursor()
-        csr.execute("SELECT * FROM concepts2 WHERE id in ({})"
-                    "".format(', '.join(['?' for _ in records])), records)
-        concepts = csr.fetchall()
-        for c in concepts:
-            (qid, source, cid, name0, nameN) = c
-            entry = {
-                'source': source, 'cid': cid, 'name0': name0, 'nameN': nameN
-            }
-            if qid not in self.concepts:
-                self.concepts[qid] = []
-            self.concepts[qid].append(entry)
+        with self.cnx.cursor() as cursor:
+            sql = "SELECT * FROM BIOASQ_CONCEPT WHERE id IN %s;"
+            cursor.execute(sql, (records,))
+            self.concepts = list(cursor.fetchall())
         return self.concepts
 
     def get_concepts(self, questions):
         logger.info("Retrieving concepts from the questions...")
-        # questions = questions[:10]
         # If not updating the database, look for the concepts in local database
         # entries. Otherwise, use data API services.
-        if not self.updateDatabase:
-            return self.read_from_db(questions)
-
-        # TmTools
-        self.run_tmtools(questions)
-        # MetaMap
-        self.run_metamap(questions)
-        # GO (Gene Ontology)
-        self.run_go_expand()
-
-        # Write to the concepts database
+        self.concepts = list()
         if self.updateDatabase:
+            # TmTools
+            self.run_tmtools(questions)
+            # MetaMap
+            self.run_metamap(questions)
+            # GO (Gene Ontology)
+            self.run_go_expand()
             self.update_database()
 
-        return self.concepts
+        if len(self.concepts) > 0:
+            return self.concepts
+        else:
+            return self.read_from_db(questions)

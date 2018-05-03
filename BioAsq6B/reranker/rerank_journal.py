@@ -16,7 +16,7 @@ The journal mesh distribution table has the following entities:
 import os
 import pickle
 import logging
-import sqlite3
+import pymysql
 from sklearn.preprocessing import normalize
 
 from BioAsq6B import PATHS
@@ -27,27 +27,55 @@ logger = logging.getLogger()
 
 class RerankerJournal(object):
     table_file = os.path.join(PATHS['data_dir'], 'journal_mesh_dist.pkl')
-    desc_db = PATHS['concepts_db']
 
     def __init__(self):
+        logger.info("Initializing a Journal reranker")
         logger.info("Loading journal mesh distribution table...")
         try:
             self.data = pickle.load(open(RerankerJournal.table_file, 'rb'))
         except:
             raise RuntimeError("Cannot load the journal distribution data [{}]"
                                "".format(RerankerJournal.table_file))
+        self.concept_retriever = None
         self.dist = self.data['dist_table']
-        try:
-            self.cnx = sqlite3.connect(RerankerJournal.desc_db)
-        except:
-            raise RuntimeError("Cannot read the MeSH concept database")
+        self.cnx = None
+        self.db_connect()
 
-    def get_mesh_name(self, cui):
-        csr = self.cnx.cursor()
-        csr.execute("SELECT * FROM mesh WHERE cui='{}';".format(cui))
-        concept = csr.fetchone()
+    def db_connect(self):
+        if self.cnx is not None and self.cnx.open:
+            return
+        # Read DB credential
+        try:
+            with open(PATHS['mysqldb_cred_file']) as f:
+                host, user, passwd, dbname = f.readline().split(',')
+            self.cnx = pymysql.connect(
+                host=host, user=user, password=passwd, db=dbname,
+                charset='utf8', cursorclass=pymysql.cursors.DictCursor
+            )
+        except (pymysql.err.DatabaseError,
+                pymysql.err.IntegrityError,
+                pymysql.err.MySQLError) as exception:
+            logger.error('DB connection failed: {}'.format(exception))
+            raise
+        finally:
+            if self.cnx is None:
+                logger.error('Problem connecting to database')
+            else:
+                logger.debug('Database for MeSH connected')
+
+    def db_close(self):
+        if self.cnx and self.cnx.open:
+            self.cnx.close()
+            pymysql.connect().close()
+
+
+    def get_mesh_name(self, mesh):
+        with self.cnx.cursor() as cursor:
+            sql = "SELECT * FROM MESH_NAME WHERE mesh_id='{}';".format(mesh)
+            cursor.execute(sql)
+            concept = cursor.fetchone()
         if concept is not None:
-            return concept[2]
+            return concept['name']
         return 'N/A'
 
     def get_jmeshes(self, qmesh):
@@ -76,23 +104,26 @@ class RerankerJournal(object):
                 return
         # Get the list of query meshes (qmeshes)
         q = ranked_docs.query
-        retriever = ConceptRetriever()
-        concepts = retriever.get_concepts([q])
-        if q['id'] not in concepts:
+        if self.concept_retriever is None:
+            self.concept_retriever = ConceptRetriever()
+        concepts = self.concept_retriever.get_concepts([q])
+        if len(concepts) <= 0:
             return
         scores = [0] * k
         # Process qmeshes
         qmeshes = []
-        for concept in concepts[q['id']]:
-            if concept['source'] == 'MetaMap':
+        for concept in concepts:
+            if concept['source'] == 'MetaMap (MeSH)':
                 qmeshes.append(concept['cid'])
             else:
                 c_ = concept['cid'].split(':')
                 if len(c_) == 3 and c_[1] == 'MESH':
                     qmeshes.append(c_[2])
 
+        print('qmeshes', qmeshes)
         q_indices = list(set([self.data['qmesh2idx'][qmesh] for qmesh in qmeshes
                               if qmesh in self.data['qmesh2idx']]))
+        print('q_indices', q_indices)
         if len(q_indices) == 0:
             return
         frequencies = normalize(self.dist[q_indices], axis=1)

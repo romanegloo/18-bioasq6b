@@ -8,6 +8,7 @@ import tempfile
 import sqlite3
 from collections import OrderedDict
 import re
+import krovetzstemmer
 
 from . import DEFAULTS, utils
 from .. import PATHS
@@ -17,16 +18,19 @@ logger = logging.getLogger()
 
 
 class GalagoSearch(object):
-    def __init__(self, args):
+    def __init__(self, args, nlp=None, idf=None):
         self.args = args
         self.index_path = PATHS['galago_idx']
         self.db_path = PATHS['concepts_db']
         self.tokenizer = DEFAULTS['tokenizer']()
         self.ngrams = 2
+        self.use_stemmer_threshold = 3  # idf ratio of stemmed/non-stemmed token
+        self.nlp = nlp
+        self.idf = idf
+        self.stemmer = krovetzstemmer.Stemmer()
 
     def closest_docs(self, query, k=10, cache=None):
         """Return RankedDocs of k closest docs for the query"""
-        a = AverageMeter()
         ranked_docs = RankedDocs(query)
         # Read from cached scores, if cache is given
         if cache is not None:
@@ -36,9 +40,8 @@ class GalagoSearch(object):
                 ranked_docs.scores['retrieval'] = cache['scores-ret'][:k]
                 return ranked_docs
         # Save temporary query_file for galago use
-        if self.args.query_model == 'sdm':
-            # Run two pass; one with stemmer and two without stemmer
-            g_verbose = (self.args.qid is not None)
+        g_verbose = (self.args.qid is not None)
+        if self.args.query_model == 'baseline':
             q_tmpl = {
                 'verbose': g_verbose,
                 'casefold': False,
@@ -47,66 +50,61 @@ class GalagoSearch(object):
                 'index': self.index_path,
                 'queries': []
             }
-            q_obj = self.query_sdm([query], q_tmpl=q_tmpl)
+            q_obj = self.query_baseline([query], q_tmpl=q_tmpl)
             (_, fp) = tempfile.mkstemp()
             json.dump(q_obj, fp=open(fp, 'w'), indent=4, separators=(',', ': '))
             p = subprocess.run(['galago', 'batch-search', fp],
                                stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
-            if self.args.qid is not None:
+            if g_verbose:
                 logger.info(p.stdout.decode('utf-8'))
-            docids_scores1 = self._extract_id_scores(p.stdout.decode('utf-8'))
-            # Run second pass
-            q_tmpl['defaultTextPart'] = 'postings.krovetz'
-            q_tmpl['queries'] = []
+            ranked_docs.rankings, ranked_docs.scores['retrieval'] = \
+                self._extract_id_scores(p.stdout.decode('utf-8'))
+            ranked_docs.update_cache.append('retrieval')
+            return ranked_docs
+        elif self.args.query_model == 'sdm':
+            use_stemmer = True  # By default, use stemmer
+            q_tmpl = {
+                'verbose': g_verbose,
+                'casefold': False,
+                'requested': k,
+                'defaultTextPart': 'postings.krovetz',
+                'index': self.index_path,
+                'queries': []
+            }
             q_obj = self.query_sdm([query], q_tmpl=q_tmpl)
+            # Check if to use Krovetz stemmer
+            tokens = [d.text for d in self.nlp(query['body'])]
+            for t in tokens:
+                try:
+                    ratio = self.idf[t.lower()] / self.idf[self.stemmer.stem(t)]
+                except KeyError:
+                    ratio = 1
+                if ratio > self.use_stemmer_threshold:
+                    logger.info("Not using stemmer: {}".format(t))
+                    use_stemmer = False
+                    break
+            if not use_stemmer:
+                q_tmpl['defaultTextPart'] = 'postings'
+                q_tmpl['queries'] = []
+                q_obj = self.query_sdm([query], q_tmpl=q_tmpl)
             (_, fp) = tempfile.mkstemp()
             json.dump(q_obj, fp=open(fp, 'w'), indent=4, separators=(',', ': '))
+            logger.info('galago search {}'.format(query['id']))
             p = subprocess.run(['galago', 'batch-search', fp],
                                stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
-            if self.args.qid is not None:
+            logger.info('search done')
+            if g_verbose:
                 logger.info(p.stdout.decode('utf-8'))
-            docids_scores2 = self._extract_id_scores(p.stdout.decode('utf-8'))
-            results = \
-                self.merge_retrieval_scores(docids_scores1, docids_scores2, k=k)
-            ranked_docs.rankings, ranked_docs.scores['retrieval'] = results
+            docids_scores = self._extract_id_scores(p.stdout.decode('utf-8'))
+            ranked_docs.rankings, ranked_docs.scores['retrieval'] = docids_scores
         ranked_docs.update_cache.append('retrieval')
         return ranked_docs
-
-    def merge_retrieval_scores(self, l1, l2, k=10):
-        """merge two lists of scores; l1 (non-stemmer results), l2 (stemmer)"""
-        scores = dict()
-        for i, docid in enumerate(l1[0]):
-            if docid not in scores:
-                scores[docid] = [l1[1][i], -9999]
-            else:
-                scores[docid][0] = l1[1][i]
-        for i, docid in enumerate(l2[0]):
-            if docid not in scores:
-                scores[docid] = [-9999, l2[1][i]]
-            else:
-                scores[docid][1] = l2[1][i]
-        docids = []
-        merged_scores = []
-        for id, v in scores.items():
-            docids.append(id)
-            merged_scores.append(max(v))
-            # if v[0] == 0:
-            #     merged_scores.append(v[1])
-            # elif v[1] == 0:
-            #     merged_scores.append(v[0])
-            # else:
-            #     merged_scores.append((v[0] + v[1]) / 2)
-        merged_sorted = sorted(zip(docids, merged_scores),
-                               key=lambda p: p[1], reverse=True)
-
-        return [x[0] for x in merged_sorted][:k], \
-               [x[1] for x in merged_sorted][:k]
 
     def sanitize(self, tokens, type):
         if type == 'band':
             tokens_ = []
             for t in tokens:
-                t = re.sub('[.-]', ' ', t)
+                t = re.sub('[.?]', ' ', t)
                 t = re.sub('[,;()]', '', t)
                 if len(t.split()) > 1:
                     tokens_.extend(t.split())
@@ -114,7 +112,8 @@ class GalagoSearch(object):
                     tokens_.append(t)
             return tokens_
         if type == 'ngrams':
-            tokens = [re.sub('[.]', ' ', t) for t in tokens]
+            tokens = [re.sub('[\']', '', t) for t in tokens]
+            tokens = [re.sub('[.;()?/]', ' ', t) for t in tokens]
             # To query for a hyphenated term; Galago tokenizes on hyphens
             tokens = ["#od:1({})".format(re.sub('[-]', ' ', t))
                       if ('-' in t) else t for t in tokens]
@@ -135,10 +134,11 @@ class GalagoSearch(object):
 
         return tokens
 
-    def query_sdm(self, queries, q_tmpl=None):
+    def query_sdm(self, queries, q_tmpl):
         for i, q in enumerate(queries):
             query = {'number': q['id']}
             tokens = self.tokenizer.tokenize(q['body'])
+
             # when using sdm or fdm, n-gram (n > 1) tokenizing is unnecessary
             ngrams = tokens.ngrams(n=1, uncased=True,
                                    filter_fn=utils.filter_ngram)
@@ -213,30 +213,23 @@ class GalagoSearch(object):
             q_tmpl['queries'].append(query)
         return q_tmpl
 
-    def query_baseline(self, queries, k=1):
-        q_tmpl = {
-            'verbose': self.args.verbose,
-            'casefold': False,  # todo, query string needs to be case sensitive
-            'requested': k,
-            'index': self.index_path,
-            'queries': []
-        }
+    def query_baseline(self, queries, q_tmpl):
         for i, q in enumerate(queries):
-            query = {'number': 'q' + str(i)}
+            query = {'number': q['id']}
             tokens = self.tokenizer.tokenize(q['body'])
             # when using sdm or fdm, n-gram (n > 1) tokenizing is unnecessary
-            ngrams = tokens.ngrams(n=self.ngrams, uncased=True,
+            ngrams = tokens.ngrams(n=3, uncased=True,
                                    filter_fn=utils.filter_ngram)
             terms = []
+            for ngram in ngrams:
+                terms.extend(ngram.split(' '))
+            terms = list(set(terms))
             for t in ngrams:
                 if len(t.split()) > 1:
-                    terms.append('#od:2({})'.format(t))
-                else:
-                    terms.append(t)
-            terms.extend(self._mesh_ui(q['id'])[0])
-
-            q_ = ' '.join(terms)
-            query['text'] = '#sdm({})'.format(q_)
+                    terms.append('#uw:2({})'.format(t))
+            combine_ = \
+                '#combine({})'.format(' '.join(self.sanitize(terms, 'ngrams')))
+            query['text'] = combine_
             q_tmpl['queries'].append(query)
         return q_tmpl
 

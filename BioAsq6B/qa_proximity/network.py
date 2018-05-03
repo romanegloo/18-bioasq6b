@@ -18,8 +18,9 @@ class QaSimBiRNN(nn.Module):
         super(QaSimBiRNN, self).__init__()
 
         # Word embedding lookup
-        self.encoder = nn.Embedding(conf['vocab-size'], conf['embedding-dim'],
-                                    padding_idx=0)
+        self.encoder = nn.Embedding(
+            conf['vocab-size'], conf['embedding-dim'], padding_idx=0
+        )
         self.encoder.weight.requires_grad = False
 
         # BiRNN - Context
