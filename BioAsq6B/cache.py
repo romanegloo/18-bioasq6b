@@ -19,7 +19,7 @@ class Cache(object):
         self.score_keys = ['retrieval']  # qasim/journal can be appended
         self.flg_update_scores = {'retrieval': False}
         self.scores_changed = False
-        self.documents_cahnged = False
+        self.documents_changed = False
 
         # Set update flags
         self.confirm_updates()
@@ -85,7 +85,7 @@ class Cache(object):
         if 'documents' in res.update_cache:
             for docid in res.rankings:
                 self.documents[docid] = res.docs_data[docid]
-            self.documents_cahnged = True
+            self.documents_changed = True
 
     def save_scores(self):
         logger.info('Saving {} entries of cached scores...'

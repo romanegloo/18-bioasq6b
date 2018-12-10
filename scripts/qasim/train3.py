@@ -11,7 +11,7 @@ import torch
 from torch.utils.data import DataLoader, sampler
 
 from BioAsq6B import common
-from BioAsq6B.qa_proximity import utils, QaSimSpan
+from BioAsq6B.QaSimSent import utils, QaSimSpan
 
 logger = logging.getLogger()
 

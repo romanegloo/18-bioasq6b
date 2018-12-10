@@ -1,3 +1,7 @@
+""" Eventually all these functions will be moved to interactive_optimize.py,
+after then this file can be removed"""
+
+
 """From the cached score, optimize the scoring weights using random search"""
 
 """
@@ -146,7 +150,7 @@ def train(ft_list=['ret', 'qasim', 'journal', 'semmeddb1', 'semmeddb2']):
             printouts.append('fold#{}'.format(iter))
             printouts.append('BEST params: {}'.format(best['vector']))
             # Test
-            stats = run_epoch(best['vector'], train_data)
+            stats = run_epoch(best['vector'], test_data)
             printouts.append('MAP: {}, vec: {}'
                              ''.format(stats['map'].avg, best['vector']))
     except KeyboardInterrupt:

@@ -41,21 +41,22 @@ def f_measure(prec, recall, beta=1):
     return (1 + b2) * prec * recall / (b2 * prec + recall)
 
 
-def avg_precision(y_true, y_pred):
-    """assuming that y_pred is in the order by the confidence score"""
-    ap_num = 0.
+def avg_precision(y_true, y_pred, cutoff=10):
+    """ Average Precision at cutoff"""
+    if len(y_pred) > cutoff:
+        y_pred = y_pred[:cutoff]
+
+    ap_numerator = 0.
     cnt_matches = 0
     for idx, item in enumerate(y_pred):
-        if item in y_true:
+        if item in y_true and item not in y_pred[:idx]:
             cnt_matches += 1
-            ap_num += cnt_matches / (idx + 1)
+            ap_numerator += cnt_matches / (idx + 1)
 
-    # avoid division by zero
-    if cnt_matches == 0:
-        return 1 if len(y_true) == 0 else 0
-    else:
-        # return ap_num / min(len(y_true), len(y_pred))
-        return ap_num / len(y_pred)
+    if not y_true:
+        return 0.
+
+    return ap_numerator / min(len(y_true), cutoff)
 
 
 def measure_performance(y_true, y_pred, cutoff=10):
@@ -126,19 +127,22 @@ class Timer(object):
 
 
 class AdaptiveRandomSearch(object):
-    def __init__(self, bounds, obj_fn, init_vec=None, data=None,
-                 max_iter=100, max_no_impr=5):
+    def __init__(self, bounds, obj_fn, init_vec=None, weight_keys=None,
+                 data=None, max_iter=100, max_no_impr=5):
         self.data = data
         self.bounds = bounds
         self.iter_mult = 5  # once in *iter_mul*, use the largest step size
         self.step_sizes = [1.00, 1.5, 3.0]  # initial/small/large factors
         self.step_size = (bounds[0][1] - bounds[0][0]) * self.step_sizes[0]
         self.current = dict()
-        if init_vec:
+        if init_vec is not None:
             self.current['vector'] = init_vec
         else:
             self.current['vector'] = self.random_vector()
-        self.objective_function = obj_fn
+        if weight_keys is not None:
+            self.objective_function = partial(obj_fn, weight_keys=weight_keys)
+        else:
+            self.objective_function = obj_fn
         self.max_iter = max_iter
         self.max_no_impr = max_no_impr  # early stop when no improvement
 
@@ -191,16 +195,16 @@ class AdaptiveRandomSearch(object):
                     self.step_size, self.current = big_stepsize, big_step
                 else:
                     self.current = step
-                logger.info("> updating the weight vector: {}"
+                logger.info("> UPDATING WEIGHT VECTOR {}"
                             ''.format(self.current['vector']))
             else:
                 count += 1
                 if count >= self.max_no_impr:
                     count = 0
                     self.step_size /= self.step_sizes[1]
-            logger.info("> iteration {}, best {}, step_size {}"
+            logger.info("> iteration {}, best {:.4f}, step_size {:.4e}"
                         ''.format(i + 1, self.current['cost'], self.step_size))
-            if self.step_size < 1e-5:
+            if self.step_size < 1e-4:
                 logger.info('> early stop (step_size {})'
                             ''.format(self.step_size))
                 break
@@ -208,7 +212,7 @@ class AdaptiveRandomSearch(object):
 
 
 class RankedDocs(object):
-    """A container for the reanked list of documents with scores and auxilary
+    """A container for the ranked list of documents with scores and auxiliary
     data entities"""
     def __init__(self, query):
         self.query = query
@@ -217,7 +221,6 @@ class RankedDocs(object):
         self.scores = dict()  # Different kinds of scores including retrieval
         self.docs_data = dict()
         self.expected_docs = []
-        self.update_cache = []  # If not empty, Cache will update the scores
         self.unseen_words = set()
         self.text_snippets = []
         # Read expected documents (GT) if exist
@@ -229,42 +232,39 @@ class RankedDocs(object):
 
     @staticmethod
     def galago_read_doc(docid):
-        p = subprocess.run(
-            ['galago', 'doc', '--index={}'.format(PATHS['galago_idx']),
-             '--id=PMID-{}'.format(docid)],
-            stdout=subprocess.PIPE
-        )
-        doc = p.stdout.decode('utf-8')
-        # find the fields in the raw text
-        fields = {'text': 'TEXT', 'title': 'TITLE', 'journal': 'MEDLINE_TA'}
-        doc_ = dict()
-        for k, v in fields.items():
-            tag_len = len('<{}>'.format(v))
-            start = doc.find('<{}>'.format(v)) + tag_len
-            end = doc.find('</{}>'.format(v))
-            if start >= end or start <= tag_len or end <= 0:
-                contents = ''
-            else:
-                contents = doc[start:end]
-            doc_[k] = contents
+        try:
+            p = subprocess.run(
+                ['galago', 'doc', '--index={}'.format(PATHS['galago_idx']),
+                 '--id=PMID-{}'.format(docid)],
+                stdout=subprocess.PIPE
+            )
+            doc = p.stdout.decode('utf-8')
+            # find the fields in the raw text
+            fields = {'text': 'TEXT', 'title': 'TITLE', 'journal': 'MEDLINE_TA'}
+            doc_ = dict()
+            doc_['docid'] = docid
+            for k, v in fields.items():
+                tag_len = len('<{}>'.format(v))
+                start = doc.find('<{}>'.format(v)) + tag_len
+                end = doc.find('</{}>'.format(v))
+                if start >= end or start <= tag_len or end <= 0:
+                    contents = ''
+                else:
+                    contents = doc[start:end]
+                doc_[k] = contents
+        except:
+            logger.error(docid)
+            raise
         return doc_
 
-    def cb_galago_read_doc(self, res, docid=None):
-        self.update_cache.append('documents')
-        self.docs_data[docid] = res
-        logger.info("reading document {} done".format(docid))
-
-    def read_doc_text(self, cache=None):
+    def read_doc_text(self):
         """Retrieve document in the rankings list from the galago index"""
-        p = Pool(16)
-        for docid in self.rankings:
-            if cache is not None and docid in cache:
-                self.docs_data[docid] = cache[docid]
-                continue
-            else:
-                cb_fn = partial(self.cb_galago_read_doc, docid=docid)
-                p.apply_async(self.galago_read_doc, args=(docid,),
-                              callback=cb_fn)
+        def cb_galago_read_doc(res):
+            self.docs_data[res['docid']] = res
+        p = Pool(30)
+        for d in self.rankings:
+            p.apply_async(self.galago_read_doc, args=(d, ),
+                          callback=cb_galago_read_doc)
         p.close()
         p.join()
 
@@ -357,7 +357,7 @@ class RankedDocs(object):
         fusion = weights['retrieval'] * ndocs * np.array(ret_norm)
         if 'qasim' in weights and 'qasim' in self.scores:
             for i, score in enumerate(self.scores['qasim']):
-                fusion[i] += np.max(score) * weights['qasim']
+                fusion[i] += sum(sorted(score)[-3:]) / 3 * weights['qasim']
         if 'journal' in weights and 'journal' in self.scores:
             fusion += np.array(self.scores['journal']) * weights['journal']
         if 'semmeddb1' in weights and 'semmeddb2' in weights \
@@ -390,3 +390,12 @@ def keys_exists(element, *keys):
         except KeyError:
             return False
     return True
+
+
+def softmax(lst):
+    exp_lst = np.exp(lst - np.max(lst))
+    norm = exp_lst / exp_lst.sum(axis=0)
+    if type(lst) == list:
+        return norm.tolist()
+    else:
+        return norm

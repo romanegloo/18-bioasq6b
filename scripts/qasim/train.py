@@ -1,8 +1,9 @@
 #!/usr/bin/env python3
-"""training a qa_proximity model"""
+"""deprecated: use the one from qasim_sent project """
+"""training a qasim model"""
 
 import argparse
-import logging
+import coloredlogs, logging
 import os
 import sys
 import re
@@ -14,7 +15,7 @@ import torch
 from torch.utils.data import DataLoader, sampler
 
 from BioAsq6B import common
-from BioAsq6B.qa_proximity import utils, QaSimSpan
+from BioAsq6B.QaSimSent import utils, QaSimSent
 
 logger = logging.getLogger()
 
@@ -110,7 +111,8 @@ def add_arguments(parser):
 def init():
     """set default values and initialize components"""
     # initialize logger
-    logger.setLevel(logging.INFO)
+    # logger.setLevel(logging.INFO)
+    coloredlogs.install(level='INFO')
     fmt = logging.Formatter('%(asctime)s: [ %(message)s ]',
                             '%m/%d/%Y %I:%M:%S %p')
     console = logging.StreamHandler()
@@ -120,6 +122,7 @@ def init():
     logger.info('-' * 100)
     logger.info('Initializing...')
 
+    exit(1)
     # set default values
     args.class_num = 2  # relevant (0) or irrelevant (1)
     args.cuda = not args.no_cuda and torch.cuda.is_available()
@@ -368,7 +371,7 @@ if __name__ == '__main__':
         # ----------------------------------------------------------------------
         # Model setup
         # ----------------------------------------------------------------------
-        model = QaSimSpan(args, word_dict, feature_dict)
+        model = QaSimSent(args, word_dict, feature_dict)
         model_summary = utils.torch_summarize(model)
         if args.print_parameters:
             logger.info(model_summary)
@@ -386,7 +389,7 @@ if __name__ == '__main__':
 
         # args.embedding_file = None  # for debugging
         if args.embedding_file:
-            model.load_embeddings(word_dict.tokens(), args.embedding_file)
+            model.load_embeddings(args.embedding_file, word_dict.tokens())
         # Set up optimizer
         model.init_optimizer()
 

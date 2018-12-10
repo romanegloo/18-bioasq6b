@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
-"""utilities (and data structure) for qa_proximity model"""
-import logging
+"""utilities (and data structure) for qasim model"""
+import logging, coloredlogs
 import json
 import unicodedata
 import torch
@@ -9,25 +9,28 @@ from torch.utils.data import Dataset
 import numpy as np
 import pickle
 
-logger = logging.getLogger(__name__)
+logger = logging.getLogger()
+coloredlogs.install(
+    level='DEBUG',
+    fmt="[%(asctime)s %(levelname)s] %(message)s"
+)
+
 
 # ------------------------------------------------------------------------------
 # Dictionary class for tokens.
 # ------------------------------------------------------------------------------
 
-
 class Dictionary(object):
-    NULL = '<NULL>'
     UNK = '<UNK>'
-    START = 2
+    START = 1
 
     @staticmethod
     def normalize(token):
         return unicodedata.normalize('NFD', token)
 
     def __init__(self):
-        self.tok2ind = {self.NULL: 0, self.UNK: 1}
-        self.ind2tok = {0: self.NULL, 1: self.UNK}
+        self.tok2ind = {self.UNK: 0}
+        self.ind2tok = {0: self.UNK}
 
     def __len__(self):
         return len(self.tok2ind)
@@ -69,13 +72,12 @@ class Dictionary(object):
         Return all the words indexed by this dictionary, except for special
         tokens.
         """
-        tokens = [k for k in self.tok2ind.keys()
-                  if k not in {'<NULL>', '<UNK>'}]
+        tokens = [k for k in self.tok2ind.keys() if k != '<UNK>']
         return tokens
 
 
 # ------------------------------------------------------------------------------
-# PyTorch Dataset class for qa_proximity model
+# PyTorch Dataset class for qasim model
 # ------------------------------------------------------------------------------
 
 class QaProxDataset(Dataset):
@@ -101,32 +103,32 @@ class QaProxDataset(Dataset):
         question = torch.LongTensor([self.word_dict[w] for w in ex['question']])
         # Create feature vector
         question_types = ['yesno', 'factoid', 'list', 'summary']
-        feat_q = torch.zeros(len(question_types))
-        feat_q[question_types.index(ex['type'])] = 1
+        qtype = torch.zeros(len(question_types))
+        qtype[question_types.index(ex['type'])] = 1
 
         feature_len = len(self.feature_dict) if self.feature_dict else 0
-        feat_c = None
+        feat_c = feat_q = None
         if feature_len > 0:
             feat_c = torch.zeros(len(ex['context']), feature_len)
+            feat_q = torch.zeros(len(ex['question']), feature_len)
             # Feature POS or NER
-            for key in ['pos', 'ner']:
-                for i, w in enumerate(ex[key]):
-                    if key + '=' + w in self.feature_dict:
-                        feat_c[i][self.feature_dict[key+'='+w]] = 1.
+            if all([k in self.conf['features'] for k in ['pos', 'ner']]):
+                for key in ['pos', 'ner']:
+                    for i, w in enumerate(ex[key]):
+                        if key + '=' + w in self.feature_dict:
+                            feat_c[i][self.feature_dict[key+'='+w]] = 1.
+                    for i, w in enumerate(ex['q_'+key]):
+                        if key + '=' + w in self.feature_dict:
+                            feat_q[i][self.feature_dict[key+'='+w]] = 1.
             # IDF
-            if 'idf-file' in self.conf and self.idf is not None:
+            if 'idf' in self.conf['features'] and self.idf is not None:
                 for i, v in enumerate(ex['context']):
-                    if v in self.idf:
-                        feat_c[i][self.feature_dict['idf']] = self.idf[v]
-                    else:
-                        feat_c[i][self.feature_dict['idf']] = 0
-            else:
-                if 'idf' in ex:
-                    # Use the IDF values in the dataset
-                    for i, v in enumerate(ex['idf']):
-                        feat_c[i][self.feature_dict['idf']] = v
-
-        return context, feat_c, question, feat_q, ex['label'], ex['qid']
+                    feat_c[i][self.feature_dict['idf']] = \
+                        self.idf[v] / self.idf_max if v in self.idf else 0
+                for i, v in enumerate(ex['question']):
+                    feat_q[i][self.feature_dict['idf']] = \
+                        self.idf[v] / self.idf_max if v in self.idf else 0
+        return context, feat_c, question, feat_q, qtype, ex['label'], ex['qid']
 
 
 def batchify(batch):
@@ -134,56 +136,61 @@ def batchify(batch):
     batch_size = len(batch)
     max_doc_length = max([ex[0].size(0) for ex in batch])
     max_q_length = max([ex[2].size(0) for ex in batch])
-    ft_c_size = batch[0][1].size(1) if batch[0][1] is not None else 0
-    ft_q_size = batch[0][3].size(0)
+    feature_size = batch[0][1].size(1) if batch[0][1] is not None else 0
 
-    # x1 (context)
+    # Context
+    # x1: word indexes
     x1 = torch.LongTensor(batch_size, max_doc_length).zero_()
-    # x1_mask (mask tensor of the context in the fixed length)
+    # x1_mask: mask tensor of the context in the fixed length
     x1_mask = torch.ByteTensor(batch_size, max_doc_length).fill_(1)
-    # x1_f (context feature vector)
-    x1_f = None
-    if ft_c_size > 0:
-        x1_f = torch.FloatTensor(batch_size, max_doc_length, ft_c_size).zero_()
-    # x2 (question)
+    # x1_f: feature vector
+    x1_f = torch.FloatTensor(batch_size, max_doc_length, feature_size).zero_() \
+        if feature_size > 0 else None
+
+    # Question
+    # x2: word indexes
     x2 = torch.LongTensor(batch_size, max_q_length).zero_()
-    # x2_mask
+    # x2_mask: mask tensor
     x2_mask = torch.ByteTensor(batch_size, max_q_length).fill_(1)
-    # x2_f (question feature vector)
-    x2_f = torch.FloatTensor(batch_size, ft_q_size).zero_()
+    # x2_f: feature vector
+    logger.info(batch[0][2])
+    x2_f = torch.FloatTensor(batch_size, max_q_length, feature_size).zero_() \
+        if feature_size > 0 else None
+    x2_qtype = torch.FloatTensor(batch_size, 4)
 
     # copy values
     for i, ex in enumerate(batch):
+        # Context
         clen = ex[0].size(0)
-        qlen = ex[2].size(0)
         x1[i, :clen].copy_(ex[0])
         x1_mask[i, :clen].fill_(0)
-        if ft_c_size > 0:
+        if ex[1] is not None:
             x1_f[i, :clen].copy_(ex[1])
+
+        # Question
+        qlen = ex[2].size(0)
         x2[i, :qlen].copy_(ex[2])
         x2_mask[i, :qlen].fill_(0)
-        x2_f[i, :ft_q_size].copy_(ex[3])
-    labels = torch.LongTensor([ex[4] for ex in batch])
-    qids = [ex[5] for ex in batch]
+        if ex[3] is not None:
+            x2_f[i, :qlen].copy_(ex[3])
+        x2_qtype[i].copy_(ex[4])
+        logger.info(x2_f)
 
-    return x1, x1_f, x1_mask, x2, x2_f, x2_mask, labels, qids
+    labels = torch.LongTensor([ex[5] for ex in batch])
+    qids = [ex[6] for ex in batch]
+
+    return x1, x1_f, x1_mask, x2, x2_f, x2_qtype, x2_mask, labels, qids
 
 
 # ------------------------------------------------------------------------------
 # helper functions
 # ------------------------------------------------------------------------------
 
-def load_data(data_dir, year=None):
+def load_data(datafile):
     """Load examples from preprocessed file.
     One example per line, JSON encoded.
     """
-    examples = []
-    # read all of relevant and irrelevant data
-    files = ['rel-t{}.txt'.format(year), 'irrel-t{}.txt'.format(year)]
-    for file in files:
-        with (data_dir / file).open() as f:
-            examples.extend([json.loads(line) for line in f])
-    return examples
+    return [json.loads(line.rstrip()) for line in open(datafile)]
 
 
 def build_feature_dict(examples):
@@ -276,3 +283,27 @@ def torch_summarize(model, show_weights=False, show_parameters=True):
 
     tmpstr = tmpstr + ')'
     return tmpstr
+
+
+# copy of the classes of common.py (for the Floyd project use)
+class AverageMeter(object):
+    """Computes and stores the average and current value."""
+
+    def __init__(self):
+        self.reset()
+
+    def __repr__(self):
+        return str(self.avg)
+
+    def reset(self):
+        self.val = 0
+        self.avg = 0
+        self.sum = 0
+        self.count = 0
+
+    def update(self, val, n=1):
+        self.val = val
+        self.sum += val * n
+        self.count += n
+        self.avg = self.sum / self.count
+

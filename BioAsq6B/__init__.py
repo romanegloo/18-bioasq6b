@@ -7,6 +7,7 @@ if sys.version_info < (3, 5):
 
 PATHS = {}
 root_dir = PosixPath(__file__).absolute().parents[2].as_posix()
+PATHS['root_dir'] = root_dir
 PATHS['data_dir'] = os.path.join(root_dir, 'data')
 PATHS['runs_dir'] = os.path.join(root_dir, 'runs')
 PATHS['test_dir'] = os.path.join(PATHS['data_dir'], 'bioasq/test')
@@ -15,15 +16,11 @@ PATHS['galago_idx'] = os.path.join(PATHS['data_dir'], 'galago-medline-full-idx')
 PATHS['concepts_db'] = os.path.join(PATHS['data_dir'], 'concepts.db')
 PATHS['qasim_model'] = os.path.join(PATHS['data_dir'], 'qa_prox/var/best.mdl')
 PATHS['idf_file'] = os.path.join(PATHS['data_dir'], 'qa_prox/idf.p')
-PATHS['embedding_file'] = os.path.join(PATHS['data_dir'],
-                          'qa_prox/embeddings/wikipedia-pubmed-and-PMC-w2v.bin')
+PATHS['embedding_file'] = \
+    '/scratch/jno236-data/word_embeddings/fastText_pretrained/wiki.en.vec'
 PATHS['mysqldb_cred_file'] = os.path.join(PATHS['data_dir'], 'db_cred.csv')
 PATHS['metamap_bin'] = '/home/jno236/opt/public_mm/bin/metamap'
-
-# Cached Qa_Sim scores file
-PATHS['cached_scores_file'] = \
-    os.path.join(PATHS['runs_dir'], 'cached_scores.pkl')
-PATHS['cached_docs_file'] = os.path.join(PATHS['runs_dir'], 'cached_docs.pkl')
+PATHS['ranklib_bin'] = os.path.join(root_dir, 'opt/RankLib-2.1-patched.jar')
 
 from . import retriever
 from .data_services import BioasqAPI

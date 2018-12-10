@@ -3,17 +3,19 @@
 
 import torch
 import torch.optim as optim
+import torch.nn as nn
 import torch.nn.functional as F
 from torch.autograd import Variable
-import copy
-from gensim.models.keyedvectors import KeyedVectors
 import logging
-import numpy as np
+from tqdm import tqdm
 
-from .network import QaSimBiRNN
+from BioAsq6B import PATHS
+from BioAsq6B.QaSimSent import utils
+from BioAsq6B.QaSimSent.network import QaSimBiRNN
 
 logger = logging.getLogger()
 logging.getLogger("gensim.models.keyedvectors").setLevel(logging.ERROR)
+
 
 class QaSimSent(object):
     def __init__(self, conf, word_dict, feature_dict=None, state_dict=None):
@@ -26,6 +28,7 @@ class QaSimSent(object):
         self.use_cuda = False
         self.parallel = False
         self.network = QaSimBiRNN(conf)
+        self.optimizer = None
         # load saved state, if exists
         if state_dict:
             self.network.load_state_dict(state_dict)
@@ -54,36 +57,57 @@ class QaSimSent(object):
             raise RuntimeError('Unsupported optimizer: %s' %
                                self.conf['optimizer'])
 
-    def load_embeddings(self, words, embedding_file):
+    def load_embeddings(self, embedding_file=None, words=None):
         """Load pre-trained embeddings for a given list of words; assume that
         the file is in word2vec binary format"""
-        words = {w for w in words if w in self.word_dict}
-        embedding = self.network.encoder.weight.data
-        w2v_model = KeyedVectors.load_word2vec_format(embedding_file,
-                                                      binary=True)
-        for w in words:
-            if w in w2v_model:
-                vec = torch.from_numpy(w2v_model[w])
-                embedding[self.word_dict[w]] = vec
-        logger.info('Copied %d embeddings (%.2f%%)' %
-                    (len(embedding), 100 * len(embedding) / len(words)))
+        if words is not None:
+            raise RuntimeError("Training is done in a separate project: "
+                               "refer to qasim_sent")
+        if embedding_file is None:
+            embedding_file = PATHS['embedding_file']
+        # Read word vectors
+        with open(embedding_file) as f:
+            logger.info('Reading a word embedding file ({})...'
+                        ''.format(embedding_file))
+            size, dim = map(int, f.readline().split())
+            assert dim == self.conf['embedding-dim']
+            logger.info('Initializing space for embeddings...')
+            # Replace embedding data; Add two for UNK
+            self.network.encoder = nn.Embedding(size+1, dim, padding_idx=0)
+            self.network.encoder.weight.requires_grad = False
+            emb_data = self.network.encoder.weight.data
+            # Replace word_dict
+            self.word_dict = utils.Dictionary()
+            pbar = tqdm(total=size)
+            for line in f:
+                v = line.split(' ')
+                try:
+                    self.word_dict.add(v[0])
+                    emb_data[self.word_dict[v[0]]] = \
+                        torch.FloatTensor([float(s) for s in v[1:dim+1]])
+                except ValueError:
+                    continue
+                pbar.update()
+            pbar.close()
+        logger.info('Copied {} word embeddings'.format(len(emb_data)-2))
 
     def update_embeddings(self, words, embedding_file):
         """Updating this models embeddings with unseen words for later use"""
-        embedding = self.network.encoder.weight.data
-        w2v_model = KeyedVectors.load_word2vec_format(embedding_file,
-                                                      binary=True)
-        cnt = 0
-        for w in words:
-            if w in w2v_model:
-                cnt += 1
-                vec = torch.from_numpy(w2v_model[w]).float().unsqueeze(0)
-                embedding = torch.cat((embedding, vec))
-                self.word_dict[w] = len(self.word_dict)
-        logger.info('Added {} embeddings ({:.2f}%)'
-                    ''.format(cnt, 100 * cnt / len(words)))
-        self.network.encoder.weight.data = embedding
-        self.conf['vocab-size'] = len(self.word_dict)
+        logger.warning("update_word_embeddings: this part needs a fix")
+        # embedding = self.network.encoder.weight.data
+        # w2v_model = KeyedVectors.load_word2vec_format(embedding_file,
+        #                                               binary=True)
+        # cnt = 0
+        # for w in words:
+        #     if w in w2v_model:
+        #         cnt += 1
+        #         vec = torch.from_numpy(w2v_model[w]).float().unsqueeze(0)
+        #         embedding = torch.cat((embedding, vec))
+        #         self.word_dict[w] = len(self.word_dict)
+        # logger.info('Added {} embeddings ({:.2f}%)'
+        #             ''.format(cnt, 100 * cnt / len(words)))
+        # self.network.encoder.weight.data = embedding
+        # self.conf['vocab-size'] = len(self.word_dict)
 
     def update(self, ex):
         """Forward a batch of examples; step the optimizer to update weights
@@ -123,26 +147,23 @@ class QaSimSent(object):
     # Prediction
     # --------------------------------------------------------------------------
 
-    def predict(self, ex, max_score=False):
-        if ex is None:
-            return Variable(torch.FloatTensor([0]))
-
+    def predict(self, ex):
         # Eval mode
         self.network.eval()
+
         # Transfer to GPU
+        ex_ = ex if len(ex) == 7 else ex[:7]
+
         if self.use_cuda:
             inputs = [e if e is None else
                       Variable(e.cuda(async=True), volatile=True)
-                      for e in ex[:6]]
+                      for e in ex_]
         else:
             inputs = [e if e is None else Variable(e, volatile=True)
-                      for e in ex[:6]]
+                      for e in ex_]
         # Forward
         scores = self.network(*inputs)
-        if max_score:
-            return scores.max()
-        else:
-            return scores
+        return scores
 
     # --------------------------------------------------------------------------
     # Runtime

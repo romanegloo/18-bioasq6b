@@ -47,9 +47,9 @@ class RerankerJournal(object):
         # Read DB credential
         try:
             with open(PATHS['mysqldb_cred_file']) as f:
-                host, user, passwd, dbname = f.readline().split(',')
+                host, user, passwd = f.readline().strip().split(',')
             self.cnx = pymysql.connect(
-                host=host, user=user, password=passwd, db=dbname,
+                host=host, user=user, password=passwd, db='jno236_ir',
                 charset='utf8', cursorclass=pymysql.cursors.DictCursor
             )
         except (pymysql.err.DatabaseError,
@@ -67,7 +67,6 @@ class RerankerJournal(object):
         if self.cnx and self.cnx.open:
             self.cnx.close()
             pymysql.connect().close()
-
 
     def get_mesh_name(self, mesh):
         with self.cnx.cursor() as cursor:
@@ -92,16 +91,10 @@ class RerankerJournal(object):
             print('{} not found'.format(qmesh))
             return ''
 
-    def get_journal_scores(self, ranked_docs, cache=None):
+    def get_journal_scores(self, ranked_docs):
         """From the list of document, get the journal sources and its
         relevance scores with respect to the given query"""
-        # Read from cached scores, if cache is given
         k = len(ranked_docs.rankings)
-        if cache is not None and 'scores-journal' in cache \
-                and cache['scores-journal'] is not None:
-            if len(cache['scores-journal']) >= k:
-                ranked_docs.scores['journal'] = cache['scores-journal'][:k]
-                return
         # Get the list of query meshes (qmeshes)
         q = ranked_docs.query
         if self.concept_retriever is None:
@@ -113,17 +106,17 @@ class RerankerJournal(object):
         # Process qmeshes
         qmeshes = []
         for concept in concepts:
-            if concept['source'] == 'MetaMap (MeSH)':
+            if concept['source'] == 'MTI (MeSH)':
                 qmeshes.append(concept['cid'])
             else:
                 c_ = concept['cid'].split(':')
                 if len(c_) == 3 and c_[1] == 'MESH':
                     qmeshes.append(c_[2])
 
-        print('qmeshes', qmeshes)
+        logger.info("qmeshes: {}".format(qmeshes))
         q_indices = list(set([self.data['qmesh2idx'][qmesh] for qmesh in qmeshes
                               if qmesh in self.data['qmesh2idx']]))
-        print('q_indices', q_indices)
+        logger.info("q-indices: {}".format(q_indices))
         if len(q_indices) == 0:
             return
         frequencies = normalize(self.dist[q_indices], axis=1)
@@ -140,7 +133,6 @@ class RerankerJournal(object):
             journal_meshes = self.data['journals'][journal_title]['mesh']
             j_indices = [self.data['jmesh2idx'][jmesh]
                          for jmesh in journal_meshes]
-            scores[i] = frequencies[:, j_indices].sum()
+            scores[i] = frequencies[:, j_indices].sum() / len(q_indices)
         ranked_docs.scores['journal'] = scores
-        ranked_docs.update_cache.append('journal')
 

@@ -7,34 +7,27 @@ import os
 import sys
 import json
 import math
-import multiprocessing
-from multiprocessing import Pool
 from datetime import datetime
-import logging
+import logging, coloredlogs
 import pickle
-from functools import partial
 import spacy
-import traceback   # may need to use this to get the traceback generated
-                     # from inside a thread or process
 
 from BioAsq6B.retriever import GalagoSearch
 from BioAsq6B import reranker, PATHS
-from BioAsq6B.cache import Cache
 from BioAsq6B.common import AverageMeter
 from BioAsq6B.data_services import ConceptRetriever
 
 
 def init():
     """Set default values and initialize components"""
-    global doc_ranker, qasim_ranker, journal_ranker, semmeddb_ranker, cache, idf
-    doc_ranker = qasim_ranker = journal_ranker = semmeddb_ranker = idf = None
+    qasim_ranker = journal_ranker = semmeddb_ranker = None
     # --------------------------------------------------------------------------
     # Set default options
     # --------------------------------------------------------------------------
     if args.qasim_model is not None:
-        # PATHS is defined in package __init__ file
         PATHS['qasim_model'] = os.path.join(PATHS['data_dir'],
                                       'qa_prox/var/{}'.format(args.qasim_model))
+    # Get a list of rerankers from the score weights parameter
     if args.score_weights is not None:
         keys = set()
         for scheme in args.score_weights.split(','):
@@ -45,7 +38,6 @@ def init():
             if scheme.startswith('semmeddb'):
                 keys.add('semmeddb')
         args.rerank = list(keys)
-
     if args.run_id is None:
         args.run_id = datetime.today().strftime("%b%d-%H%M")
     PATHS['log_file'] = os.path.join(PATHS['runs_dir'], args.run_id + '.log')
@@ -53,17 +45,13 @@ def init():
     # --------------------------------------------------------------------------
     # Configure a logger
     # --------------------------------------------------------------------------
-    logger.setLevel(logging.INFO)
-    # also use this logger in the multiprocessing module
-    mlp = multiprocessing.log_to_stderr()
-    mlp.setLevel(logging.WARN)
-    fmt = logging.Formatter('%(asctime)s: [ %(message)s ]',
-                            '%m/%d/%Y %I:%M:%S %p')
-    if args.verbose:
-        console = logging.StreamHandler()
-        console.setFormatter(fmt)
-        logger.addHandler(console)
-    else:
+    coloredlogs.install(
+        level='DEBUG',
+        fmt="[%(asctime)s %(levelname)s] %(message)s"
+    )
+    if not args.verbose:
+        fmt = logging.Formatter(
+            '%(asctime)s: [ %(message)s ]', '%m/%d/%Y %I:%M:%S %p')
         file = logging.FileHandler(PATHS['log_file'])
         file.setFormatter(fmt)
         logger.addHandler(file)
@@ -73,12 +61,12 @@ def init():
     # --------------------------------------------------------------------------
     # Read datasets (question/answer pairs)
     # --------------------------------------------------------------------------
-    # Reading test datasets.
+    # Reading datasets.
+    questions = []
     if args.mode != 'dry':
-        if args.batch is None:
-            batches = [1, 2, 3, 4, 5]
-        else:
-            batches = args.batch.split(',')
+        if args.batch is None:  # If batch is not specified, read all
+            args.batch = '1,2,3,4,5'
+        batches = args.batch.split(',')
         for b in batches:
             batch_file = 'phaseB_{}b_0{}.json'.format(args.year, b)
             logger.info('Reading test dataset: {}'.format(batch_file))
@@ -88,19 +76,33 @@ def init():
                 if args.qid is not None:
                     for q in data['questions']:
                         if args.qid == q['id']:
-                            test_data.append([q])
+                            questions.append([q])
                 else:
                     if args.debug:
-                        test_data.append(data['questions'][:3])
+                        questions.append(data['questions'][:3])
                     else:
-                        test_data.append(data['questions'])
-        if len(test_data) > 0:
-            logger.info('Testing pairs: {}'.format([len(b) for b in test_data]))
+                        questions.append(data['questions'])
+        if args.qid is not None:
+            args.batch = '1'
+        logger.info('Testing pairs: {}'.format([len(b) for b in questions]))
+    elif args.mode == 'dry':
+        if args.dryrun_file is None:
+            # Assuming a specific year and batch is provided
+            args.dryrun_file = \
+                os.path.join(PATHS['test_dir'],
+                             'phaseA_{}b_0{}.json'.format(args.year,
+                                                          args.batch))
+        with open(args.dryrun_file) as f:
+            data = json.load(f)
+            if args.debug:
+                questions.append(data['questions'][:3])
+            else:
+                questions.append(data['questions'])
+        logger.info('Dryrun pairs: {}'.format([len(b) for b in questions]))
 
     # --------------------------------------------------------------------------
     # Initialize components
     # --------------------------------------------------------------------------
-    cache = Cache(args)
     idf = pickle.load(open(PATHS['idf_file'], 'rb'))
     logger.info('{} idf scores loaded'.format(len(idf)))
     logger.info('Loading Spacy parser...')
@@ -112,9 +114,8 @@ def init():
     if 'qasim' in args.rerank:
         logger.info('initializing QaSim-ranker...')
         qasim_ranker = reranker.RerankQaSim(args, nlp)
-
         if args.print_parameters:
-            from BioAsq6B.qa_proximity import utils
+            from BioAsq6B.QaSimSent import utils
             model_summary = utils.torch_summarize(qasim_ranker.predictor.model)
             logger.info(model_summary)
         # Check if the model needs to load idf data
@@ -131,6 +132,8 @@ def init():
         logger.info('initializing SemMedDB-ranker...')
         semmeddb_ranker = reranker.RerankerSemMedDB()
 
+    return questions, doc_ranker, qasim_ranker, journal_ranker, semmeddb_ranker
+
 
 def add_arguments(parser):
     """Define parameters with user provided arguments"""
@@ -138,7 +141,7 @@ def add_arguments(parser):
     runtime = parser.add_argument_group('Runtime Settings')
     runtime.add_argument('--mode', type=str, default='test',
                          choices=['test', 'dry'],
-                         help='Run mode; dry run results an output file')
+                         help='Run mode; dry run returns an output file')
     runtime.add_argument('--run-id', type=str, default=None,
                          help='Identifiable name for each run')
     runtime.add_argument('-y', '--year', type=int, default=6,
@@ -158,8 +161,11 @@ def add_arguments(parser):
     runtime.add_argument('--update-concepts', action='store_true',
                          help='Get concepts from data services, and update '
                               'the existing concepts database')
-    runtime.add_argument('--num-workers', type=int, default=40,
-                         help='Number of workers in a multiprocessing pool')
+    runtime.add_argument('--update-word-embeddings', action='store_true',
+                         help='Update word embeddings for QAsim model; Adding '
+                              'unseen words')
+    runtime.add_argument('--output-scores', action='store_true',
+                         help='Stores a JSON file of all the scores')
     runtime.add_argument('--debug', action='store_true')
     # Retriever Settings
     retriever = parser.add_argument_group('Retriever Settings')
@@ -176,7 +182,7 @@ def add_arguments(parser):
                           choices=['weighted_sum', 'rrf'],
                           help='Score fusion method')
     reranker.add_argument('--query-model', type=str, default='sdm',
-                          choices=['baseline', 'sdm'],
+                          choices=['baseline', 'sdm', 'sdm_mesh', 'rm3'],
                           help='document retrieval model')
     reranker.add_argument('--word-dict-file', type=str, default='word_dict.pkl',
                           help='Path to word_dict file for test/dry run')
@@ -194,7 +200,6 @@ def write_result_articles(res, stats=None, seq=None):
         logger.info('=== {} / {} ==='.format(*seq))
 
     res.write_result(printout=args.verbose, stats=stats)
-    cache.update_scores(res)  # Update scores if necessary
     if len(res.unseen_words) > 0:
         global unseen_words
         unseen_words |= res.unseen_words
@@ -206,7 +211,6 @@ def add_results(res, articles=None, seq=None):
         logger.info('=== {} / {} ==='.format(*seq))
     articles[res.query['id']] = res
     res.write_result(printout=args.verbose)
-    cache.update_scores(res)  # Update scores if necessary
     if len(res.unseen_words) > 0:
         global unseen_words
         unseen_words |= res.unseen_words
@@ -216,49 +220,61 @@ def add_results(res, articles=None, seq=None):
 def query(q):
     """run retrieval procedure (optionally rerank) of one question and return
     the result"""
-    if q['id'] in cache.scores:
-        cache_score = cache.scores[q['id']]
-    else:
-        cache_score = None
-    if cache.flg_update_scores['retrieval']:
-        ranked_docs = doc_ranker.closest_docs(q, k=args.ndocs)
-    else:
-        ranked_docs = doc_ranker.closest_docs(q, k=args.ndocs, cache=cache_score)
-    # After retrieval, read documents
-    cache_docs = {k: cache.documents[k] for k in ranked_docs.rankings
-                  if k in cache.documents}
-    ranked_docs.read_doc_text(cache=cache_docs)
+    ranked_docs = doc_ranker.closest_docs(q, k=args.ndocs)
+    if 'qasim' in args.rerank or 'journal' in args.rerank:
+        # After retrieval, read documents
+        if args.verbose:
+            logger.info('Reading documents for later use...')
+        ranked_docs.read_doc_text()
     if 'qasim' in args.rerank:
-        if cache.flg_update_scores['qasim']:
-            qasim_ranker.get_qasim_scores(ranked_docs)
-        else:
-            qasim_ranker.get_qasim_scores(ranked_docs, cache=cache_score)
+        qasim_ranker.get_qasim_scores(ranked_docs)
         ranked_docs.unseen_words = qasim_ranker.predictor.add_words
     if 'journal' in args.rerank:
-        if cache.flg_update_scores['journal']:
-            journal_ranker.get_journal_scores(ranked_docs)
-        else:
-            journal_ranker.get_journal_scores(ranked_docs, cache=cache_score)
+        journal_ranker.get_journal_scores(ranked_docs)
     if 'semmeddb' in args.rerank:
-        if cache.flg_update_scores['semmeddb']:
-            semmeddb_ranker.get_semmeddb_scores(ranked_docs)
-        else:
-            semmeddb_ranker.get_semmeddb_scores(ranked_docs, cache=cache_score)
+        semmeddb_ranker.get_semmeddb_scores(ranked_docs)
 
     ranked_docs.merge_scores(args.score_weights)
     return ranked_docs
 
 
-def save_results_dry(questions, results):
-    concepts = dict()
-    # Concepts need to be grouped by qids
-    for c in results['concepts']:
-        if c['id'] not in concepts:
-            concepts[c['id']] = list()
-        concepts[c['id']].append(c)
-    articles = results['articles']  # RankdedDocs
-    rdfs = results['RDF']
+def save_results_test(lstRankedDocs, year=None, batch=None):
+    """Return format:
+    {"questions": [
+        {
+            "qid": id,
+            "body": question body,
+            "year": year,
+            "batch": batch,
+            "ranked_docs": [docid1, docid2, ..., docidn],
+            "relevancy": [1, 1, 0, 1, ..., 0]
+            "scores": {
+                "retrieval": [s1, s2, s3, ..., sn],
+                "qasim": [s1', s2', s3', ..., sn'],
+                "journal": [ ... ],
+                "semmeddb": [ ... ]
+            }
+        }
+    ]}
+    """
+    questions = []
+    for res in lstRankedDocs:
+        record = dict()
+        record['qid'] = res.query['id']
+        record['qbody'] = res.query['body']
+        record['year'] = year
+        record['batch'] = batch
+        record['ranked_docs'] = res.rankings
+        record['relevancy'] = [1 if d in res.expected_docs else 0
+                               for d in res.rankings]
+        record['scores'] = res.scores
+        questions.append(record)
+    filename = "scores-{}_{}-{}.json".format(year, batch, args.run_id)
+    score_file = os.path.join(PATHS['runs_dir'], filename)
+    json.dump(questions, open(score_file, 'w'))
+    logger.info("Saving the scores [{}]".format(score_file))
 
+def save_results_dry(questions, results):
     """return format:
     {"questions":[
         {
@@ -293,6 +309,15 @@ def save_results_dry(questions, results):
         }, ...
     ]}
     """
+    concepts = dict()
+    # Concepts need to be grouped by qids
+    for c in results['concepts']:
+        if c['id'] not in concepts:
+            concepts[c['id']] = list()
+        concepts[c['id']].append(c)
+    articles = results['articles']  # RankdedDocs
+    rdfs = results['RDF']
+
     output = dict()
     output['questions'] = []
     res_keys = ['type', 'body', 'id', 'documents', 'snippets', 'concepts',
@@ -365,9 +390,8 @@ def save_results_dry(questions, results):
 
 def test():
     batch_report = '== Results over batches ==\n'
-    global unseen_words
-    unseen_words = set()
-    for b in range(len(test_data)):
+    for i, b in enumerate(map(int, args.batch.split(','))):
+        lstRankedDocs = []
         stats = {
             'avg_prec': AverageMeter(),
             'avg_recall': AverageMeter(),
@@ -375,64 +399,36 @@ def test():
             'map': AverageMeter(),
             'logp': AverageMeter()
         }
-        if args.qid:
-            res = query(test_data[b][0])
-            res.write_result(printout=True, stats=stats, topn=args.ndocs)
-            cache.update_scores(res)  # Update scores if necessary
-        else:
-            # Generate pool for multiprocessing
-            # p = Pool(16)
-            for seq, q in enumerate(test_data[b]):
-                res = query(q)
-                write_result_articles(res, seq=(seq, len(test_data[b])),
-                                      stats=stats)
-                # Callback function to write the results of queries
-                # cb_write_results = \
-                #     partial(write_result_articles,
-                #             seq=(seq, len(test_data[b])), stats=stats)
-                # p.apply_async(query, args=(q, ), callback=cb_write_results)
-            # p.close()
-            # p.join()
+        for seq, q in enumerate(questions[i]):
+            logger.info('Querying: {}'.format(q['id']))
+            res = query(q)
+            topn = args.ndocs if args.qid is not None or args.verbose else 10
+            res.write_result(printout=args.verbose, stats=stats, topn=topn,
+                             seq=(seq, len(questions[i])))
+            lstRankedDocs.append(res)
         # Report the overall batch performance measures
         gmap = math.exp(stats['logp'].avg)
         report = ("[Test Run #{} batch #{}] "
                   "prec.: {:.4f}, recall: {:.4f}, f1: {:.4f} "
                   "map: {:.4f}, gmap: {:.4f}"
-                  ).format(args.run_id, b+1, stats['avg_prec'].avg,
+                  ).format(args.run_id, b, stats['avg_prec'].avg,
                            stats['avg_recall'].avg, stats['avg_f1'].avg,
                            stats['map'].avg, gmap)
         logger.info(report)
         batch_report += report + '\n'
+        if args.output_scores:
+            save_results_test(lstRankedDocs, year=args.year, batch=b)
     if args.verbose:
         print(batch_report)
     else:
         logger.info(batch_report)
     # Update word_dict (on dry run, new words can be found)
-    if 'qasim' in cache.flg_update_scores and cache.flg_update_scores['qasim'] \
-        and len(unseen_words) > 0:
+    if args.update_word_embeddings and len(unseen_words) > 0:
         qasim_ranker.predictor.update_word_dict(unseen_words)
 
 
 def dryrun():
-    global unseen_words
-    unseen_words = set()
-    if args.dryrun_file is None:
-        if args.year and args.batch:
-            # Assuming a specific year and batch is provided
-            args.dryrun_file = \
-                os.path.join(PATHS['test_dir'],
-                             'phaseA_{}b_0{}.json'.format(args.year,
-                                                          args.batch))
-        else:
-            logger.error('Either dryrun-file or a specific year/batch needs '
-                         'to be provided')
     results = dict()
-    # Read dryrun file
-    with open(args.dryrun_file) as f:
-        data = json.load(f)
-        questions = data['questions'] \
-            if not args.debug else data['questions'][:3]
-    logger.info('{} questions read'.format(len(questions)))
     # Retrieve concepts
     cr = ConceptRetriever(updateDatabase=args.update_concepts)
     results['concepts'] = cr.get_concepts(questions)
@@ -445,8 +441,7 @@ def dryrun():
     # RDF triples
     results['RDF'] = dict()
     # Update word_dict (on dry run, new words can be found)
-    if 'qasim' in cache.flg_update_scores and cache.flg_update_scores['qasim'] \
-            and len(unseen_words) > 0:
+    if args.update_word_embeddings and len(unseen_words) > 0:
         qasim_ranker.predictor.update_word_dict(unseen_words)
     save_results_dry(questions, results)
 
@@ -454,26 +449,19 @@ def dryrun():
 if __name__ == '__main__':
     # Global
     logger = logging.getLogger()
-    test_data = []
     # Set Options
     parser = argparse.ArgumentParser(
         'BioAsq6B', formatter_class=argparse.ArgumentDefaultsHelpFormatter
     )
     add_arguments(parser)
     args = parser.parse_args()
-
     # Initialize
-    init()
+    (questions, doc_ranker, qasim_ranker, journal_ranker, semmeddb_ranker) = \
+        init()
+    unseen_words = set()
 
-    # RUN; For training, use scripts/data_entities/interactive_train.py
+    # # RUN; For training, use scripts/data_entities/interactive_train.py
     if args.mode == 'test':
         test()
     elif args.mode == 'dry':
         dryrun()
-
-    # Postprocess; Save cache data, if updated
-    if cache.scores_changed:
-        cache.save_scores()
-    if cache.documents_cahnged:
-        cache.save_docs()
-

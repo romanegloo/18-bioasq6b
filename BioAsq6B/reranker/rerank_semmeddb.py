@@ -24,15 +24,13 @@ from itertools import combinations
 from collections import Counter
 
 from .. import PATHS
-from ..cache import Cache
 
 logger = logging.getLogger()
 
 
 class RerankerSemMedDB(object):
-    def __init__(self, cache=None):
+    def __init__(self):
         self.cnx = None
-        self.cache = cache
         self.db_connect()
 
     def db_connect(self):
@@ -41,9 +39,9 @@ class RerankerSemMedDB(object):
         # Read DB credential
         try:
             with open(PATHS['mysqldb_cred_file']) as f:
-                host, user, passwd, dbname = f.readline().split(',')
+                host, user, passwd = f.readline().strip().split(',')
             self.cnx = pymysql.connect(
-                host=host, user=user, password=passwd, db=dbname,
+                host=host, user=user, password=passwd, db='semmed_31_r',
                 charset='utf8', cursorclass=pymysql.cursors.DictCursor,
                 connect_timeout=60*60
             )
@@ -67,8 +65,8 @@ class RerankerSemMedDB(object):
         with self.cnx.cursor() as cursor:
             # Get the list of non-generic concepts from the concepts DB
             sql = (
-                "SELECT * FROM BIOASQ_CONCEPT AS cpt"
-                "  LEFT OUTER JOIN GENERIC_CONCEPT AS gen"
+                "SELECT * FROM jno236_ir.BIOASQ_CONCEPT AS cpt"
+                "  LEFT OUTER JOIN GENERIC_CONCEPT AS gen"""
                 "  ON (cpt.cid = gen.CUI)"
                 "  WHERE cpt.id=%s AND cpt.source=%s AND gen.CUI IS NULL"
             )
@@ -112,12 +110,6 @@ class RerankerSemMedDB(object):
         features and its score; 1) if any of the CUI pairs of a question
         matches the document predication entries, 2) how many of the question
         CUIs are found in the document"""
-        # If qid is given, read ranked list of documents from the cached scores
-        if qid is not None:
-            # check if cache scores exists. If not read from the file
-            if self.cache is None:
-                self.cache = Cache()
-            docs = self.cache.scores[qid]['rankings']
         # Otherwise, list of docs must be given to compute the score
         if len(docs) <= 0:
             return
@@ -149,17 +141,10 @@ class RerankerSemMedDB(object):
                 scores.append((ft_1, ft_2))
         return scores
 
-    def get_semmeddb_scores(self, ranked_docs, cache=None):
+    def get_semmeddb_scores(self, ranked_docs):
         """From the question and the ranked list of documents, return
         SemMedDB feature scores"""
-
-        # If cached scores exist, return them
         k = len(ranked_docs.rankings)
-        if cache is not None and 'scores-semmeddb' in cache \
-                and cache['scores-semmeddb'] is not None:
-            if len(cache['scores-semmeddb']) >= k:
-                ranked_docs.scores['semmeddb'] = cache['scores-semmeddb'][:k]
-                return
         # Get the list of query concepts (CUIs)
         q = ranked_docs.query
         cuis = self.get_cuis(q['id'])
@@ -187,4 +172,3 @@ class RerankerSemMedDB(object):
                 ft_2 = int(cursor.fetchone()['cnt']) / len(cuis)
             scores[i] = (ft_1, ft_2)
         ranked_docs.scores['semmeddb'] = scores
-        ranked_docs.update_cache.append('semmeddb')

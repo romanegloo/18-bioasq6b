@@ -121,4 +121,3 @@ class MetamapExt(object):
             for rec in self.cursor.fetchall():
                 meshHeadings.append(rec)
         return meshHeadings
-

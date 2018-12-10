@@ -33,9 +33,9 @@ class ConceptRetriever(object):
         # Read DB credential
         try:
             with open(PATHS['mysqldb_cred_file']) as f:
-                host, user, passwd, dbname = f.readline().split(',')
+                host, user, passwd = f.readline().strip().split(',')
             self.cnx = pymysql.connect(
-                host=host, user=user, password=passwd, db=dbname,
+                host=host, user=user, password=passwd, db='jno236_ir',
                 charset='utf8', cursorclass=pymysql.cursors.DictCursor,
                 connect_timeout=2*60*60
             )
