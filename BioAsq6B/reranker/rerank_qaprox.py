@@ -22,23 +22,23 @@ class RerankQaSim(object):
         sentences and its offsets"""
         q = ranked_docs.query
         self.predictor.set_q(q['body'], q['type'])
-        k = len(ranked_docs.rankings)
+        # k = len(ranked_docs.rankings)
         # Validate qasim_scores; Qasim score for a docid should be given in
         # an array format
-        scores_ = []
-        snippets_ = []
+        results = []
         for docid in ranked_docs.rankings:
-            logger.info('qasim for qid {} docid {}'.format(q['id'], docid))
-            s, t = self.predictor.predict_prob_b(
+            print('qasim evaluating docid {}\r'.format(docid), end='')
+            # Predict on the body of the document (ignore title)
+            result = self.predictor.predict_prob_b(
                 ranked_docs.docs_data[docid]['text'],
-                ranked_docs.docs_data[docid]['title'],
                 docid=docid
             )
-            scores_.append(s)
-            snippets_.extend(t)
-        ranked_docs.scores['qasim'] = scores_[:k]
-        ranked_docs.text_snippets = \
-            sorted(snippets_, key=lambda t: t[1], reverse=True)
+            results.append(result)
+        scores_ = [[r['score'] for r in d] for d in results]
+        ranked_docs.scores['qasim'] = scores_
+        # sort_idx = sorted(range(len(scores_)), key=lambda k: scores_[k],
+        #                   reverse=True)
+        # ranked_docs.text_snippets = [results[i][0]['text'] for i in sort_idx]
 
     def get_sentence(self, docid, text):
         """read document and split by sentence, and yield each sentence"""

@@ -6,11 +6,8 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torch.autograd import Variable
 
-logger = logging.getLogger(__name__)
-coloredlogs.install(
-    level='DEBUG',
-    fmt="[%(asctime)s %(levelname)s] %(message)s"
-)
+logger = logging.getLogger()
+
 
 # ------------------------------------------------------------------------------
 # Network
@@ -21,16 +18,16 @@ class QaSimBiRNN(nn.Module):
         super(QaSimBiRNN, self).__init__()
 
         # Word embedding lookup; encoder can be overwritten in test mode
-        self.encoder = nn.Embedding(
-            conf['vocab-size'], conf['embedding-dim'], padding_idx=0
-        )
+        self.encoder = nn.Embedding(conf['vocab-size'], conf['embedding-dim'])
         self.encoder.weight.requires_grad = False
 
         # BiRNN - Context
         c_input_size = conf['embedding-dim'] + conf['num-features']
         q_input_size = conf['embedding-dim'] + conf['num-features']
-        # BiRNN - Context
-        self.c_rnn = EncoderBRNN(
+
+        # What if I share these parameters; studies shown that sharing the
+        # parameters significantly increases performance and converges faster
+        self.s_rnn = EncoderBRNN(
             rnn_type=conf['rnn-type'],
             input_size=c_input_size,
             hidden_size=conf['hidden-size'],
@@ -39,16 +36,27 @@ class QaSimBiRNN(nn.Module):
             dropout_rate=conf['dropout-rate'],
             dropout_output=conf['dropout-output']
         )
-        # BiRNN - Question
-        self.q_rnn = EncoderBRNN(
-            rnn_type=conf['rnn-type'],
-            input_size=q_input_size,
-            hidden_size=conf['hidden-size'],
-            concat_layers=conf['concat-rnn-layers'],
-            num_layers=conf['num-rnn-layers'],
-            dropout_rate=conf['dropout-rate'],
-            dropout_output=conf['dropout-output']
-        )
+
+        # # BiRNN - Context
+        # self.c_rnn = EncoderBRNN(
+        #     rnn_type=conf['rnn-type'],
+        #     input_size=c_input_size,
+        #     hidden_size=conf['hidden-size'],
+        #     concat_layers=conf['concat-rnn-layers'],
+        #     num_layers=conf['num-rnn-layers'],
+        #     dropout_rate=conf['dropout-rate'],
+        #     dropout_output=conf['dropout-output']
+        # )
+        # # BiRNN - Question
+        # self.q_rnn = EncoderBRNN(
+        #     rnn_type=conf['rnn-type'],
+        #     input_size=q_input_size,
+        #     hidden_size=conf['hidden-size'],
+        #     concat_layers=conf['concat-rnn-layers'],
+        #     num_layers=conf['num-rnn-layers'],
+        #     dropout_rate=conf['dropout-rate'],
+        #     dropout_output=conf['dropout-output']
+        # )
         c_hidden_size = 2 * conf['hidden-size']
         q_hidden_size = 2 * conf['hidden-size']
         if conf['concat-rnn-layers']:
@@ -64,42 +72,42 @@ class QaSimBiRNN(nn.Module):
         # self.rel_attn = NTN(c_hidden_size, q_hidden_size + 4)
         self.rel_attn = BilinearSeqAttn(c_hidden_size, q_hidden_size + 4)
 
-    def forward(self, x1, x1_f, x1_mask, x2, x2_f, x2_qtype, x2_mask):
+    def forward(self, c, c_f, c_mask, q, q_f, q_qtype, q_mask) -> torch.Tensor:
         """Inputs:
-        x1 = context word indices              [batch * len_c]
-        x1_f = context word features indices   [batch * len_c * nfeat]
-        x1_mask = context padding mask         [batch * len_c]
-        x2 = question word indices             [batch * len_q]
-        x2_f = question word features indices  [batch * len_q * nfeat]
-        x2_qtype = question type               [batch * 4]
-        x2_mask = question padding mask        [batch * len_q]
+        c = context word indices              [batch * len_c]
+        c_f = context word features indices   [batch * len_c * nfeat]
+        c_mask = context padding mask         [batch * len_c]
+        q = question word indices             [batch * len_q]
+        q_f = question word features indices  [batch * len_q * nfeat]
+        q_qtype = question type               [batch * 4]
+        q_mask = question padding mask        [batch * len_q]
 
         Note. mask is not being used in with any of RNNs
         """
         # Embed both context and question
-        x1_emb = self.encoder(x1)
-        x2_emb = self.encoder(x2)
+        c_emb = self.encoder(c)
+        q_emb = self.encoder(q)
 
         # Encode (context + features) with RNN
-        if x1_f is None:
-            c_hiddens = self.c_rnn(x1_emb, x1_mask)
+        if c_f is None:
+            c_hiddens = self.s_rnn(c_emb, c_mask)
         else:
-            c_hiddens = self.c_rnn(torch.cat([x1_emb, x1_f], 2), x1_mask)
-        if x2_f is None:
-            q_hiddens = self.q_rnn(x2_emb, x2_mask)
+            c_hiddens = self.s_rnn(torch.cat([c_emb, c_f], 2), c_mask)
+        if q_f is None:
+            q_hiddens = self.s_rnn(q_emb, q_mask)
         else:
-            q_hiddens = self.q_rnn(torch.cat([x2_emb, x2_f], 2), x2_mask)
+            q_hiddens = self.s_rnn(torch.cat([q_emb, q_f], 2), q_mask)
 
         # Attention layer for questions
-        q_attn_weights = self.q_attn(q_hiddens, x2_mask)
+        q_attn_weights = self.q_attn(q_hiddens, q_mask)
         q_merged = weighted_avg(q_hiddens, q_attn_weights)
 
         # Attention layer for context
         # c_attn_weights = self.c_attn(c_hiddens, x1_mask)
         # c_merged = weighted_avg(c_hiddens, c_attn_weights)
         c_merged, c_weights = \
-            self.c_attn(q_merged.unsqueeze(1), c_hiddens, x1_mask)
-        q_plus_qtype = torch.cat([q_merged, x2_qtype], 1)
+            self.c_attn(q_merged.unsqueeze(1), c_hiddens, c_mask)
+        q_plus_qtype = torch.cat([q_merged, q_qtype], 1)
         # predict relevance
         # score = self.rel_attn(c_hiddens, q_plus_feature, x1_mask)
         score = self.rel_attn(c_merged.squeeze(1), q_plus_qtype)
@@ -172,16 +180,31 @@ class EncoderBRNN(nn.Module):
         return output
 
     def _forward_padded(self, x, x_mask):
-        # Sort input sequences (sequence lengths in descending order)
-        lengths = x_mask.data.eq(0).long().sum(1).squeeze()
-        _, idx_sort = torch.sort(lengths, dim=0, descending=True)
-        _, idx_unsort = torch.sort(idx_sort, dim=0)  # to reverse the order
-        lengths = list(lengths[idx_sort])
-        idx_sort = Variable(idx_sort)
-        idx_unsort = Variable(idx_unsort)
+        """Sort input sequences by its lengths in descending order for
+        performance reason"""
+        # Sum the masks to get the lengths of the sequences and its sorted order
+        lengths, idx_sort = torch.sort(x_mask.eq(0).sum(1),
+                                       descending=True)
+        _, idx_unsort = torch.sort(idx_sort)  # To reverse the order
         x = x.index_select(0, idx_sort)
-        x = x.transpose(0, 1)
-        rnn_input = nn.utils.rnn.pack_padded_sequence(x, lengths)
+
+        # lengths = x_mask.data.eq(0).long().sum(1)
+        # print(lengths)
+        # _, idx_sort = torch.sort(lengths, dim=0, descending=True)
+        # _, idx_unsort = torch.sort(idx_sort, dim=0)  # to reverse the order
+        # print(idx_sort)
+        # lengths = list(lengths[idx_sort])
+        # print(lengths)
+        # idx_sort = Variable(idx_sort)
+        # idx_unsort = Variable(idx_unsort)
+        #
+        # # # Sort x
+        # x = x.index_select(0, idx_sort)
+        # # # Transpose batch and sequence dim
+        # # x = x.transpose(0, 1)
+        # Pack it up
+        rnn_input = nn.utils.rnn.pack_padded_sequence(
+            x.index_select(0, idx_sort), lengths.tolist(), batch_first=True)
 
         # Feed into RNN layers
         outputs = [rnn_input]

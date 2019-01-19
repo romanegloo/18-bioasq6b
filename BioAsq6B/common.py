@@ -321,7 +321,7 @@ class RankedDocs(object):
         else:
             report = ''
         if printout:
-            logger.info("Details:\n" + table.get_string() + "\n")
+            print(table.get_string())
             if seq is not None:
                 line = '[seq. {}/{}] {}'.format(*seq, report)
             else:

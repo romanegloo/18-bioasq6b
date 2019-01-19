@@ -2,11 +2,12 @@
 """QA_Proximity predictor; Classifies if the given text is relevant to the
 question."""
 
-import logging, coloredlogs
+from typing import Tuple, List
+import logging
 import spacy
 from spacy.tokenizer import Tokenizer
 import torch
-from torch.autograd import Variable
+import  torch.functional as F
 import re
 import pickle
 import prettytable
@@ -15,21 +16,18 @@ from .model import QaSimSent
 from .. import PATHS
 
 logger = logging.getLogger()
-coloredlogs.install(
-    level='DEBUG',
-    fmt="[%(asctime)s %(levelname)s] %(message)s"
-)
 
 
 class Predictor(object):
     """Interface for computing QASim scores"""
-    def __init__(self, args, nlp=None):
+    def __init__(self, model_path=None, nlp=None, load_wd=False):
         """Set default properties and load a pretrained model"""
-        logger.info('Initializing QaSim model...')
-        self.args = args
         self.nlp = nlp if nlp is not None else spacy.load('en')
         self.tokenizer = Tokenizer(self.nlp.vocab)
-        self.model, _ = QaSimSent.load(PATHS['qasim_model'])
+        if model_path is None:
+            self.model, _ = QaSimSent.load(PATHS['qasim_model'])
+        else:
+            self.model, _ = QaSimSent.load(model_path, load_wd=load_wd)
         self.conf = self.model.conf
         self.add_words = set()
         # Model setup according to the trained model configuration
@@ -39,173 +37,130 @@ class Predictor(object):
         self.q_ex = self.q_f = self.q_type = self.q_mask = None
 
     def get_qasim_scores(self, q, qtype, a):
+        """Called by an interactive script"""
         print("[Questions: {}]".format(q))
-        q = self.sanitize(q)
-        a = self.sanitize(a)  # This can be multiple sentences document
-
         # Encode the question
-        self.set_q(q, qtype)
+        self.set_q(self.sanitize(q), qtype)
         # Batchify the candidate answers
-        batch_a, sentences_a = self.batchify_context(a)
-        scores = self.model.predict(batch_a)
+        batches, doc = self.batchify(self.sanitize(a))
+        if batches is None:
+            return [], []
+        predictions = self.model.predict(batches)
 
         table = prettytable.PrettyTable(['Score', 'Sentence'])
         table.align['Score'] = 'r'
         table.align['Sentence'] = 'l'
         table.max_width['Sentence'] = 80
-        for i, span in enumerate(sentences_a):
-            table.add_row([scores[i].data[0], span.text])
+        for i, sent in enumerate(doc.sents):
+            table.add_row([predictions[i].item(), sent.text])
         print(table.get_string())
-        return scores, sentences_a
+        return predictions, doc
 
-    def update_word_dict(self, unseen_words):
-        """If new tokens exist, update the word_dict and save"""
-        if len(unseen_words) > 0:
-            logger.info('{} new words found. '.format(len(unseen_words)))
-            logger.info('Updating word_embeddings of the Qasim model')
-            self.model.update_embeddings(unseen_words, PATHS['embedding_file'])
-            logger.info('After size {}'
-                        ''.format(self.model.network.encoder.weight.data.shape))
-            self.model.save(PATHS['qasim_model'])
-
-    def predict_prob_b(self, body, title, docid=None):
+    def predict_prob_b(self, body, docid):
+        """Called by QA_reranker; Run the model on a document body (ignore the
+        title, assuming that the title does not answer any question)"""
         """Feed in to the model and get scores in batch"""
+        results = list()  # List of results by sentences
+        # A question must be given
         if any(e is None
                for e in [self.q_ex, self.q_f, self.q_type, self.q_mask]):
             return [], []
-        batch_t, sentences_t = self.batchify_context(self.sanitize(title))
-        if batch_t is None:
-            pred_t = Variable(torch.FloatTensor([-float('inf')]))
-        else:
-            pred_t = self.model.predict(batch_t).max()
-
-        batch_b, sentences_b = self.batchify_context(self.sanitize(body))
+        # Apply the model on the body document
+        batch_b, doc = self.batchify(self.sanitize(body))
         if batch_b is None:
-            logger.warning("could not encode text: {}".format(body))
+            return [], []
         pred_b = self.model.predict(batch_b)
-        # res = F.sigmoid(torch.cat((pred_t, pred_b), dim=0)).data.tolist()
-        res = torch.cat((pred_t, pred_b), dim=0).data.tolist()
-        snippets = []
-        tmpl_ = "http://www.ncbi.nlm.nih.gov/pubmed/{}"
-        # From a title
-        title_text = ' '.join([s.text for s in sentences_t])
-        entry = ({
-            'document': tmpl_.format(docid),
-            'text': title_text,
-            'offsetInBeginSection': 0,
-            'offsetInEndSection': len(title_text),
-            'beginSection': 'title',
-            'endSection': 'title'
-        }, res[0])
-        snippets.append(entry)
+        res = torch.sigmoid(pred_b)
         # From body
-        for i, sent in enumerate(sentences_b):
-            entry = ({
-                'document': tmpl_.format(docid),
+        assert len(res) == len(list(doc.sents))
+        for i, sent in enumerate(doc.sents):
+            entry = {
+                'document': "http://www.ncbi.nlm.nih.gov/pubmed/" + docid,
                 'text': sent.text,
-                'offsetInBeginSection': 0,
-                'offsetInEndSection': 0,
-                'beginSection': '',
-                'endSection': ''
-            }, res[i])
-            doc = body
-            entry[0]['beginSection'] = 'abstract'
-            entry[0]['endSection'] = 'abstract'
-            offset_start = doc.find(sent.text)
-            if offset_start >= 0:
-                entry[0]['offsetInBeginSection'] = offset_start
-                entry[0]['offsetInEndSection'] = offset_start + len(sent.text)
-            snippets.append(entry)
-        return res, snippets
+                'offsetInBeginSection': sent.start_char,
+                'offsetInEndSection': sent.end_char,
+                'beginSection': 'abstract',
+                'endSection': 'abstract',
+                'score': res[i].item()
+            }
+            results.append(entry)
+        return results
 
     def set_q(self, q, qtype):
         self.q_ex, self.q_f, self.q_type, self.q_mask = self._encode_q(q, qtype)
 
     def _encode_q(self, q, qtype):
         tokens = self.nlp(q)
-        ex = dict()
-        ex['body'] = [t.text.lower() for t in tokens]
-        ex['pos'] = [t.pos_ for t in tokens]
-        ex['ner'] = [t.ent_type_ for t in tokens]
-        ex['embedding'] = []
-        for t in ex['body']:
-            if t in self.model.word_dict:
-                ex['embedding'].append(self.model.word_dict[t])
-            else:
-                ex['embedding'].append(1)
-        x2 = torch.LongTensor(ex['embedding'])
-        x2_f = \
-            torch.FloatTensor(len(tokens), self.conf['num-features']).fill_(0)
+        text_lower = [t.text.lower() for t in tokens]
+        q_ = [self.model.word_dict[t] if t in self.model.word_dict else 0
+              for t in text_lower]
+        q = torch.LongTensor(q_)
+        q_f = torch.zeros(len(tokens), self.conf['num-features'])
+
         if 'pos' in self.model.conf['features']:
             # Feature POS
-            for i, w in enumerate(ex['pos']):
-                if 'pos='+w in self.model.feature_dict:
-                    x2_f[i][self.model.feature_dict['pos='+w]] = 1.0
-
+            for i, t in enumerate(tokens):
+                if 'pos=' + t.pos_ in self.model.feature_dict:
+                    q_f[i][self.model.feature_dict['pos='+t.pos_]] = 1
         if 'ner' in self.model.conf['features']:
             # Feature NER
-            for i, w in enumerate(ex['ner']):
-                if 'ner='+w in self.model.feature_dict:
-                    x2_f[i][self.model.feature_dict['ner='+w]] = 1.0
-
+            for i, t in enumerate(tokens):
+                if 'ner=' + t.ent_type_ in self.model.feature_dict:
+                    q_f[i][self.model.feature_dict['ner='+t.ent_type_]] = 1
         if 'idf' in self.model.conf['features']:
             if 'idf' in self.conf['features']:
-                for i, w in enumerate(ex['body']):
+                for i, t in enumerate(text_lower):
                     try:
-                        x2_f[i][-1] = self.idf[w.lower()]
+                        q_f[i][-1] = self.idf[t]
                     except KeyError:
-                        x2_f[i][-1] = 0  # ignore the tokens that are not indexed
+                        q_f[i][-1] = 0  # ignore the tokens that are not indexed
         question_types = ['yesno', 'factoid', 'list', 'summary']
-        x2_qtype = torch.zeros(len(question_types))
+        q_type = torch.zeros(len(question_types), dtype=torch.float)
         try:
-            x2_qtype[question_types.index(qtype)] = 1
+            q_type[question_types.index(qtype)] = 1
         except ValueError:
-            x2_qtype[3] = 1
-        q_mask = torch.ByteTensor(len(tokens)).zero_()
-        return x2, x2_f, x2_qtype, q_mask
+            q_type[3] = 1
+        q_mask = torch.zeros(len(tokens), dtype=torch.uint8)
 
-    def batchify_context(self, context):
+        return q, q_f, q_type, q_mask
+
+    def batchify(self, context):
         if len(context) == 0:
             return None, []
         try:
             doc = self.nlp(context)
         except:  # SpaCy tokenizer has some issues with certain characters
             return None, []
-        sentences = list(doc.sents)
-        batch_len = len(sentences)
-        max_doc_length = max([len(sent) for sent in sentences] + [0])
+        batch_len = len(list(doc.sents))
+        max_doc_length = max([len(s) for s in doc.sents] + [0])
         ft_size = self.conf['num-features']
 
-        x1 = torch.LongTensor(batch_len, max_doc_length).zero_()
-        x1_mask = torch.ByteTensor(batch_len, max_doc_length).fill_(1)
-        x1_f = x2_f = None
+        c = torch.zeros(batch_len, max_doc_length, dtype=torch.long)
+        c_mask = torch.ones(batch_len, max_doc_length, dtype=torch.uint8)
+        c_f = None
         if ft_size > 0:
-            x1_f = \
-                torch.FloatTensor(batch_len, max_doc_length, ft_size).zero_()
-            x2_f = torch.FloatTensor(batch_len, len(self.q_ex), ft_size).zero_()
-        x2 = torch.LongTensor(batch_len, len(self.q_ex)).zero_()
-        x2_mask = torch.ByteTensor(batch_len, len(self.q_ex)).zero_()
-        x2_qtype = torch.FloatTensor(batch_len, 4)
+            c_f = torch.zeros(batch_len, max_doc_length, ft_size)
 
-        for i, sent in enumerate(sentences):
-            x1_, x1_f_, x1_mask_ = \
+        for i, sent in enumerate(doc.sents):
+            c_, c_f_, c_mask_ = \
                 self._encode_ex(sent.text, doc[sent.start:sent.end])
-            clen = x1_.size(1)
-            # Rarely the sizes do not match. Need to investigate further
+            clen = c_.size(1)
             try:
-                x1[i, :clen].copy_(x1_.view_as(x1[i, :clen]))
+                c[i, :clen].copy_(c_.view_as(c[i, :clen]))
             except:
                 logger.error(sent)
                 raise
-            x1_mask[i, :clen].fill_(0)
+            c_mask[i, :clen].fill_(0)
             if ft_size > 0:
-                x1_f[i, :clen].copy_(x1_f_)
-                x2_f[i, :, :].copy_(self.q_f)
-            x2[i].copy_(self.q_ex)
-            x2_qtype[i].copy_(self.q_type)
+                c_f[i, :clen].copy_(c_f_)
 
-        inputs = (x1, x1_f, x1_mask, x2, x2_f, x2_qtype, x2_mask)
-        return inputs, sentences
+        # Repeat the question tensors
+        q_ex = self.q_ex.unsqueeze(0).repeat(batch_len, 1)  # batch x qlen
+        q_f = self.q_f.unsqueeze(0).repeat(batch_len, 1, 1)  # batch x qlen x nf
+        q_type = self.q_type.repeat(batch_len, 1)  # batch x 4
+        q_mask = self.q_mask.unsqueeze(0).repeat(batch_len, 1)  # batch x qlen
+        inputs = (c, c_f, c_mask, q_ex, q_f, q_type, q_mask)
+        return inputs, doc
 
     def _encode_ex(self, sent, tokens=None):
         if len(self.conf['features']) == 0:

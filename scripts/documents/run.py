@@ -47,7 +47,7 @@ def init():
     # --------------------------------------------------------------------------
     coloredlogs.install(
         level='DEBUG',
-        fmt="[%(asctime)s %(levelname)s] %(message)s"
+        fmt="[%(asctime)s %(name)s %(levelname)s] %(message)s"
     )
     if not args.verbose:
         fmt = logging.Formatter(
@@ -184,8 +184,6 @@ def add_arguments(parser):
     reranker.add_argument('--query-model', type=str, default='sdm',
                           choices=['baseline', 'sdm', 'sdm_mesh', 'rm3'],
                           help='document retrieval model')
-    reranker.add_argument('--word-dict-file', type=str, default='word_dict.pkl',
-                          help='Path to word_dict file for test/dry run')
     # Model Architecture: model specific options
     model = parser.add_argument_group('Model Architecture')
     model.add_argument('--qasim-model', type=str, default=None,
@@ -422,9 +420,6 @@ def test():
         print(batch_report)
     else:
         logger.info(batch_report)
-    # Update word_dict (on dry run, new words can be found)
-    if args.update_word_embeddings and len(unseen_words) > 0:
-        qasim_ranker.predictor.update_word_dict(unseen_words)
 
 
 def dryrun():
@@ -440,9 +435,6 @@ def dryrun():
                     seq=(seq, len(questions)))
     # RDF triples
     results['RDF'] = dict()
-    # Update word_dict (on dry run, new words can be found)
-    if args.update_word_embeddings and len(unseen_words) > 0:
-        qasim_ranker.predictor.update_word_dict(unseen_words)
     save_results_dry(questions, results)
 
 

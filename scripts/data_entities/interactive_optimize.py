@@ -39,6 +39,7 @@ import re
 import json
 import subprocess
 import numpy as np
+from numpy import inf
 import random
 from collections import OrderedDict
 import logging
@@ -64,11 +65,11 @@ gt_data = dict()  # All the questions with GTs
 scores = []  # Locally stored scores of retrieval and re-rankings
 scores_batches = []  # Limit to specific years and batches
 default_score_weights = OrderedDict([
-    ('retrieval', 0.1697),
-    ('qasim', 0.7267),
-    ('journal', 0.0414),
-    ('semmeddb1', 0.0103),
-    ('semmeddb2', 0.0567)
+    ('retrieval', 0.1716),
+    ('qasim', 0.7066),
+    ('journal', 0.0203),
+    ('semmeddb1', 0.0069),
+    ('semmeddb2', 0.0945)
 ])
 l2r_model_name = [
     'MART', 'RankNet', 'RankBoost', 'AdaRank', 'CoordinateAscent',
@@ -100,7 +101,7 @@ banner = """
 """
 
 debug = None
-qasim_stats = []
+qasim_stats = None
 
 # Related to GoogleAPIs
 SCOPES = 'https://www.googleapis.com/auth/spreadsheets'
@@ -115,14 +116,24 @@ def usage():
 
 
 def init():
+    global qasim_stats
+
     print("=== Initializing ===")
     # Aggregate all the scores; filenames in "scores-[3-6]_[1-5].json" format
     print("  Reading all the saved scores...")
+    qascores = []  # Place to store all the QASim scores for later use
     for f in os.listdir(PATHS['runs_dir']):
-        m = re.search(r'^scores-([3-6])_([1-5])\.json', f)
+        m = re.search(r'^scores-([6])_([1-5])\.json', f)
         if m:
             scores_file = os.path.join(PATHS['runs_dir'], f)
-            scores.extend(json.load(open(scores_file)))
+            records = json.load(open(scores_file))
+            # Handle -inf scores
+            for rec in records:
+                if 'qasim' in rec['scores']:
+                    for x in rec['scores']['qasim']:
+                        x[x == -inf] = 0
+                        qascores.extend(x)
+            scores.extend(records)
             scores_batches.append((int(m.group(1)), int(m.group(2))))
     print("  {} questions and the scores are read".format(len(scores)))
     # Reading example from the training dataset
@@ -134,23 +145,16 @@ def init():
     # Reading all the test datasets; filenames in "phaseB_[1-6]_0[1-5].json"
     print("  Reading test datasets...")
     for f in os.listdir(PATHS['test_dir']):
-        if re.match(r'^phaseB_[1-6]b_0[1-5]\.json', f):
+        if re.match(r'^phaseB_[5-6]b_0[1-5]\.json', f):
             filepath = os.path.join(PATHS['test_dir'], f)
             data = json.load(open(filepath))
             for q in data['questions']:
                 if q['id'] not in gt_data:
                     gt_data[q['id']] = q
     print("  {} examples read from the test datasets".format(len(gt_data)))
-    # Read all the qasim score and get min, max, mean, std for later usage
-    qascores = []
-    for q in scores:
-        if 'qasim' in q['scores']:
-            for d in q['scores']['qasim']:
-                for s in d:
-                    qascores.append(float(s))
-    qa_array = np.array(qascores)
-    qasim_stats.extend([qa_array.min(), qa_array.max(), qa_array.mean(),
-                        qa_array.std()])
+    na_qascores = np.array(qascores)
+    qasim_stats = [na_qascores.min(), na_qascores.max(), na_qascores.mean(),
+                   na_qascores.std()]
     print("  QASim stats: min ({:.4f}) max ({:.4f}) mean({:.4f}) std({:.4f})"
           ''.format(*qasim_stats))
 
@@ -232,15 +236,17 @@ def eval(year, batches=None, weights=None, ranker=6):
             for rec in scores:  # Score fusion by running ARS
                 if rec['year'] == year and rec['batch'] == b:
                     merge_scores(rec, weights, stats)
-            eval_l2r_batch(year, b, ranker, stats=stats)  # RankLib
+            if ranker != 0:
+                eval_l2r_batch(year, b, ranker, stats=stats)  # RankLib
             print('=== performance measures (year {} batch {}) ==='
                   ''.format(year, b))
             print(' - MAP_0 (sort by retrieval scores): {:.4f}'
                   ''.format(stats['map0'].avg))
             print(' - MAP_1 (sort by fusion scores -- ARS)): {:.4f}'
                   ''.format(stats['map1'].avg))
-            print(' - MAP_2 (sort by RankLib[{}] scores): {:.4f}'
-                  ''.format(l2r_model_name[ranker], stats['map2'].avg))
+            if ranker != 0:
+                print(' - MAP_2 (sort by RankLib[{}] scores): {:.4f}'
+                      ''.format(l2r_model_name[ranker], stats['map2'].avg))
             print(' - Precision: {:.4f}'.format(stats['avg_prec'].avg))
             print(' - Recall: {:.4f}'.format(stats['avg_recall'].avg))
             print(' - F1: {:.4f}'.format(stats['avg_f1'].avg))
@@ -360,8 +366,8 @@ def run_ars(year=6, features=None):
 
 
 def run_l2r(year=None, ranker=1):
-    """Run RankLib (https://goo.gl/rZNxMb) for tranining a model. It 
-    assumes that the software is installed properly, and the set of features 
+    """Run RankLib (https://goo.gl/rZNxMb) for tranining a model. It
+    assumes that the software is installed properly, and the set of features
     with its weights are defined in *default_score_weights* """
     if ranker == 5:
         logger.warning('WARN. ranker 5 does not exist.')

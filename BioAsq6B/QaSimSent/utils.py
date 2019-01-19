@@ -140,12 +140,16 @@ def batchify(batch):
 
     # Context
     # x1: word indexes
-    x1 = torch.LongTensor(batch_size, max_doc_length).zero_()
+    x1 = torch.zeros(batch_size, max_doc_length, dtype=torch.long)
+    # x1 = torch.LongTensor(batch_size, max_doc_length).zero_()
     # x1_mask: mask tensor of the context in the fixed length
-    x1_mask = torch.ByteTensor(batch_size, max_doc_length).fill_(1)
+    x1_mask = torch.ones(batch_size, max_doc_length, dtype=torch.uint8)
+    # x1_mask = torch.ByteTensor(batch_size, max_doc_length).fill_(1)
     # x1_f: feature vector
-    x1_f = torch.FloatTensor(batch_size, max_doc_length, feature_size).zero_() \
-        if feature_size > 0 else None
+    x1_f = torch.zeros(batch_size, max_doc_length, feature_size) \
+        if feature_size >0 else None
+    # x1_f = torch.FloatTensor(batch_size, max_doc_length, feature_size).zero_() \
+    #     if feature_size > 0 else None
 
     # Question
     # x2: word indexes
