@@ -1,12 +1,11 @@
-#!/usr/bin/env python3
-import logging, coloredlogs
+import logging
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torch.autograd import Variable
 
-logger = logging.getLogger()
+logger = logging.getLogger(__name__)
 
 
 # ------------------------------------------------------------------------------
@@ -17,17 +16,16 @@ class QaSimBiRNN(nn.Module):
     def __init__(self, conf):
         super(QaSimBiRNN, self).__init__()
 
-        # Word embedding lookup; encoder can be overwritten in test mode
-        self.encoder = nn.Embedding(conf['vocab-size'], conf['embedding-dim'])
+        # Word embedding lookup
+        self.encoder = nn.Embedding(conf['vocab-size'], conf['embedding-dim'],
+                                    padding_idx=0)
         self.encoder.weight.requires_grad = False
 
         # BiRNN - Context
         c_input_size = conf['embedding-dim'] + conf['num-features']
-        q_input_size = conf['embedding-dim'] + conf['num-features']
-
-        # What if I share these parameters; studies shown that sharing the
-        # parameters significantly increases performance and converges faster
-        self.s_rnn = EncoderBRNN(
+        q_input_size = conf['embedding-dim']
+        # BiRNN - Context
+        self.c_rnn = EncoderBRNN(
             rnn_type=conf['rnn-type'],
             input_size=c_input_size,
             hidden_size=conf['hidden-size'],
@@ -36,27 +34,16 @@ class QaSimBiRNN(nn.Module):
             dropout_rate=conf['dropout-rate'],
             dropout_output=conf['dropout-output']
         )
-
-        # # BiRNN - Context
-        # self.c_rnn = EncoderBRNN(
-        #     rnn_type=conf['rnn-type'],
-        #     input_size=c_input_size,
-        #     hidden_size=conf['hidden-size'],
-        #     concat_layers=conf['concat-rnn-layers'],
-        #     num_layers=conf['num-rnn-layers'],
-        #     dropout_rate=conf['dropout-rate'],
-        #     dropout_output=conf['dropout-output']
-        # )
-        # # BiRNN - Question
-        # self.q_rnn = EncoderBRNN(
-        #     rnn_type=conf['rnn-type'],
-        #     input_size=q_input_size,
-        #     hidden_size=conf['hidden-size'],
-        #     concat_layers=conf['concat-rnn-layers'],
-        #     num_layers=conf['num-rnn-layers'],
-        #     dropout_rate=conf['dropout-rate'],
-        #     dropout_output=conf['dropout-output']
-        # )
+        # BiRNN - Question
+        self.q_rnn = EncoderBRNN(
+            rnn_type=conf['rnn-type'],
+            input_size=q_input_size,
+            hidden_size=conf['hidden-size'],
+            concat_layers=conf['concat-rnn-layers'],
+            num_layers=conf['num-rnn-layers'],
+            dropout_rate=conf['dropout-rate'],
+            dropout_output=conf['dropout-output']
+        )
         c_hidden_size = 2 * conf['hidden-size']
         q_hidden_size = 2 * conf['hidden-size']
         if conf['concat-rnn-layers']:
@@ -65,52 +52,48 @@ class QaSimBiRNN(nn.Module):
 
         # Non-linear sequence attention layer
         self.q_attn = LinearSeqAttn(q_hidden_size)
-        # self.c_attn = LinearSeqAttn(c_hidden_size)
-        self.c_attn = Attention(c_hidden_size)
+        self.c_attn = LinearSeqAttn(c_hidden_size)
 
         # Bilinear attention
-        # self.rel_attn = NTN(c_hidden_size, q_hidden_size + 4)
-        self.rel_attn = BilinearSeqAttn(c_hidden_size, q_hidden_size + 4)
+        self.rel_attn = BilinearSeqAttn_v2v(c_hidden_size,
+                                  q_hidden_size + len(conf['question-types']))
 
-    def forward(self, c, c_f, c_mask, q, q_f, q_qtype, q_mask) -> torch.Tensor:
+    def forward(self, x1, x1_f, x1_mask, x2, x2_f, x2_mask):
         """Inputs:
-        c = context word indices              [batch * len_c]
-        c_f = context word features indices   [batch * len_c * nfeat]
-        c_mask = context padding mask         [batch * len_c]
-        q = question word indices             [batch * len_q]
-        q_f = question word features indices  [batch * len_q * nfeat]
-        q_qtype = question type               [batch * 4]
-        q_mask = question padding mask        [batch * len_q]
+        x1 = context word indices              [batch * len_c]
+        x1_f = context word features indices   [batch * len_c * nfeat]
+        x1_mask = context padding mask         [batch * len_c]
+        x2 = question word indices             [batch * len_q]
+        x2_f = question word features indices  [batch * len_q * nfeat]
+        x2_mask = question padding mask        [batch * len_q]
 
         Note. mask is not being used in with any of RNNs
         """
         # Embed both context and question
-        c_emb = self.encoder(c)
-        q_emb = self.encoder(q)
+        x1_emb = self.encoder(x1)
+        x2_emb = self.encoder(x2)
 
         # Encode (context + features) with RNN
-        if c_f is None:
-            c_hiddens = self.s_rnn(c_emb, c_mask)
+        if x1_f is None:
+            c_hiddens = self.c_rnn(x1_emb, x1_mask)
         else:
-            c_hiddens = self.s_rnn(torch.cat([c_emb, c_f], 2), c_mask)
-        if q_f is None:
-            q_hiddens = self.s_rnn(q_emb, q_mask)
-        else:
-            q_hiddens = self.s_rnn(torch.cat([q_emb, q_f], 2), q_mask)
+            c_hiddens = self.c_rnn(torch.cat([x1_emb, x1_f], 2), x1_mask)
+
+        # Encode question embeddings with RNN; x2_f will be added later
+        q_hiddens = self.q_rnn(x2_emb, x2_mask)
 
         # Attention layer for questions
-        q_attn_weights = self.q_attn(q_hiddens, q_mask)
+        q_attn_weights = self.q_attn(q_hiddens, x2_mask)
         q_merged = weighted_avg(q_hiddens, q_attn_weights)
 
         # Attention layer for context
-        # c_attn_weights = self.c_attn(c_hiddens, x1_mask)
-        # c_merged = weighted_avg(c_hiddens, c_attn_weights)
-        c_merged, c_weights = \
-            self.c_attn(q_merged.unsqueeze(1), c_hiddens, c_mask)
-        q_plus_qtype = torch.cat([q_merged, q_qtype], 1)
+        c_attn_weights = self.c_attn(c_hiddens, x1_mask)
+        c_merged = weighted_avg(c_hiddens, c_attn_weights)
+
+        q_plus_feature = torch.cat([q_merged, x2_f], 1)
         # predict relevance
         # score = self.rel_attn(c_hiddens, q_plus_feature, x1_mask)
-        score = self.rel_attn(c_merged.squeeze(1), q_plus_qtype)
+        score = self.rel_attn(c_merged, q_plus_feature, x1_mask)
 
         return score
 
@@ -180,31 +163,16 @@ class EncoderBRNN(nn.Module):
         return output
 
     def _forward_padded(self, x, x_mask):
-        """Sort input sequences by its lengths in descending order for
-        performance reason"""
-        # Sum the masks to get the lengths of the sequences and its sorted order
-        lengths, idx_sort = torch.sort(x_mask.eq(0).sum(1),
-                                       descending=True)
-        _, idx_unsort = torch.sort(idx_sort)  # To reverse the order
+        # Sort input sequences (sequence lengths in descending order)
+        lengths = x_mask.data.eq(0).long().sum(1).squeeze()
+        _, idx_sort = torch.sort(lengths, dim=0, descending=True)
+        _, idx_unsort = torch.sort(idx_sort, dim=0)  # to reverse the order
+        lengths = list(lengths[idx_sort])
+        idx_sort = Variable(idx_sort)
+        idx_unsort = Variable(idx_unsort)
         x = x.index_select(0, idx_sort)
-
-        # lengths = x_mask.data.eq(0).long().sum(1)
-        # print(lengths)
-        # _, idx_sort = torch.sort(lengths, dim=0, descending=True)
-        # _, idx_unsort = torch.sort(idx_sort, dim=0)  # to reverse the order
-        # print(idx_sort)
-        # lengths = list(lengths[idx_sort])
-        # print(lengths)
-        # idx_sort = Variable(idx_sort)
-        # idx_unsort = Variable(idx_unsort)
-        #
-        # # # Sort x
-        # x = x.index_select(0, idx_sort)
-        # # # Transpose batch and sequence dim
-        # # x = x.transpose(0, 1)
-        # Pack it up
-        rnn_input = nn.utils.rnn.pack_padded_sequence(
-            x.index_select(0, idx_sort), lengths.tolist(), batch_first=True)
+        x = x.transpose(0, 1)
+        rnn_input = nn.utils.rnn.pack_padded_sequence(x, lengths)
 
         # Feed into RNN layers
         outputs = [rnn_input]
@@ -261,122 +229,43 @@ class LinearSeqAttn(nn.Module):
             beta: batch * q_len
         """
         out_ = self.linear(x)
-        out_ = out_.squeeze(2)
+        out_ = out_.squeeze()
         out_.data.masked_fill_(x_mask.data, -float('inf'))
         beta = F.softmax(out_, dim=1)
-
         return beta
 
 
 class BilinearSeqAttn(nn.Module):
-    """Variant of BilinearSeqAttn, attention over x w.r.t y"""
+    """A bilinear attention layer over a sequence X w.r.t y"""
     def __init__(self, x_size, y_size):
         super(BilinearSeqAttn, self).__init__()
+        self.linear = nn.Linear(y_size, x_size)
+
+    def forward(self, x, y, x_mask):
+        """
+        In:
+            x: batch * c_len * c_hidden_size
+            y: batch * q_hidden_size
+            x_mask: batch * c_len
+        Out:
+            out_ = batch * c_len
+        """
+        Wy = self.linear(y)
+        xWy = x.bmm(Wy.unsqueeze(2)).squeeze(2)
+        xWy.data.masked_fill_(x_mask.data, -float('inf'))
+        return xWy.max(1)[0]
+
+
+class BilinearSeqAttn_v2v(nn.Module):
+    """Variant of BilinearSeqAttn, attention over x w.r.t y"""
+    def __init__(self, x_size, y_size):
+        super(BilinearSeqAttn_v2v, self).__init__()
         self.bilinear = nn.Bilinear(x_size, y_size, 1)
 
-    def forward(self, x, y):
-        return self.bilinear(x, y).squeeze(1)
+    def forward(self, x, y, x_mask):
+        xWy = self.bilinear(x, y).squeeze(1)
 
-
-class Attention(nn.Module):
-    """from https://is.gd/apncgK (torchnlp and from IBM seq2seq attention)
-    Args:
-        dimensions (int): Dimensionality of the query and context.
-        attention_type (str, optional): How to compute the attention score:
-
-            * dot: :math:`score(H_j,q) = H_j^T q`
-            * general: :math:`score(H_j, q) = H_j^T W_a q`
-
-    Example:
-
-         >>> attention = Attention(256)
-         >>> query = torch.randn(5, 1, 256)
-         >>> context = torch.randn(5, 5, 256)
-         >>> output, weights = attention(query, context)
-         >>> output.size()
-         torch.Size([5, 1, 256])
-         >>> weights.size()
-         torch.Size([5, 1, 5])
-    """
-
-    def __init__(self, dimensions, attention_type='general'):
-        super(Attention, self).__init__()
-
-        if attention_type not in ['dot', 'general']:
-            raise ValueError('Invalid attention type selected.')
-
-        self.attention_type = attention_type
-        if self.attention_type == 'general':
-            self.linear_in = nn.Linear(dimensions, dimensions, bias=False)
-
-        self.linear_out = nn.Linear(dimensions * 2, dimensions, bias=False)
-        self.softmax = nn.Softmax(dim=-1)
-        self.tanh = nn.Tanh()
-
-    def forward(self, query, context, c_mask):
-        """
-        Args:
-            query (:class:`torch.FloatTensor` [batch size, output length, dimensions]): Sequence of
-                queries to query the context.
-            context (:class:`torch.FloatTensor` [batch size, query length, dimensions]): Data
-                overwhich to apply the attention mechanism.
-
-        Returns:
-            :class:`tuple` with `output` and `weights`:
-            * **output** (:class:`torch.LongTensor` [batch size, output length, dimensions]):
-              Tensor containing the attended features.
-            * **weights** (:class:`torch.FloatTensor` [batch size, output length, query length]):
-              Tensor containing attention weights.
-        """
-        batch_size, output_len, dimensions = query.size()
-        query_len = context.size(1)
-
-        if self.attention_type == "general":
-            query = query.view(batch_size * output_len, dimensions)
-            query = self.linear_in(query)
-            query = query.view(batch_size, output_len, dimensions)
-
-        # (batch_size, output_len, dimensions) * (batch_size, query_len, dimensions) ->
-        # (batch_size, output_len, query_len)
-        context.masked_fill_(c_mask.unsqueeze(2), 0)
-        attention_scores = torch.bmm(query, context.transpose(1, 2).contiguous())
-
-        # Compute weights across every context sequence
-        attention_scores = attention_scores.view(batch_size * output_len, query_len)
-        attention_weights = self.softmax(attention_scores)
-        attention_weights = attention_weights.view(batch_size, output_len,
-                                                   query_len)
-
-        # (batch_size, output_len, query_len) * (batch_size, query_len, dimensions) ->
-        # (batch_size, output_len, dimensions)
-        mix = torch.bmm(attention_weights, context)
-
-        # concat -> (batch_size * output_len, 2*dimensions)
-        combined = torch.cat((mix, query), dim=2)
-        combined = combined.view(batch_size * output_len, 2 * dimensions)
-
-        # Apply linear_out on every 2nd dimension of concat
-        # output -> (batch_size, output_len, dimensions)
-        output = self.linear_out(combined).view(batch_size, output_len, dimensions)
-        output = self.tanh(output)
-
-        return output, attention_weights
-
-class NTN(nn.Module):
-    """Neural Tensor Network (NTN) by Socher"""
-    def __init__(self, x_size, y_size):
-        super(NTN, self).__init__()
-        self.k = 2  # the number of slices
-        self.bilinear = nn.Bilinear(x_size, y_size, self.k)
-        self.linear_V = nn.Linear(x_size + y_size, self.k)
-        self.nonlinear = torch.nn.ReLU6()
-        self.linear_u = nn.Linear(self.k, 1, bias=False)
-
-    def forward(self, x, y):
-        xWy = self.bilinear(x, y)
-        Vx_y = self.linear_V(torch.cat((x, y), -1))
-        out = self.linear_u(self.nonlinear(xWy + Vx_y)).squeeze(1)
-        return out
+        return xWy
 
 
 # ------------------------------------------------------------------------------
